@@ -763,7 +763,7 @@ class AOTExecutorCodegen : public MixedModeVisitor {
     String run_func_name = runtime::get_name_mangled(mod_name, runtime::symbol::tvm_module_main);
     dict_attrs.Set("global_symbol", run_func_name);
     dict_attrs.Set("runner_function", Bool(true));
-    dict_attrs.Set(tvm::attr::kTarget, target_host_);
+    dict_attrs.Set(tvm::attr::kTarget, config_->host_target);
 
     tir::Stmt device_activations = GenerateAllDeviceHook("Activate");
     tir::Stmt device_deactivations = GenerateAllDeviceHook("Deactivate");
@@ -784,13 +784,18 @@ class AOTExecutorCodegen : public MixedModeVisitor {
    * brief Create tir::Var for input/output while updating
    * the buffer_maps.
    */
-  void CreateIOVar(const Expr& expr, std::string name) {
+  void CreateIOVar(const Expr& expr, const std::string& original_name,
+                   bool use_unique_name = true) {
     if (expr->IsInstance<TupleNode>()) {
       Tuple tuple = Downcast<Tuple>(expr);
       for (unsigned i = 0; i < tuple->fields.size(); i++) {
-        CreateIOVar(tuple->fields[i], name + std::to_string(i) + "_");
+        CreateIOVar(tuple->fields[i], original_name);
       }
     } else {
+      std::string name = original_name;
+      if (use_unique_name) {
+        name = GetUniqueIOVarName(original_name);
+      }
       tir::Var var = tir::Var(name, DataType::Handle());
       main_signature_.push_back(var);
       auto tensor_type = expr->checked_type().as<TensorTypeNode>();
@@ -801,6 +806,19 @@ class AOTExecutorCodegen : public MixedModeVisitor {
                                        name + "_buffer", 16, 1, tir::BufferType::kDefault);
       main_buffer_map_.Set(var, buffer);
       io_tensor_types_.Set(var, Downcast<TensorType>(expr->checked_type()));
+    }
+  }
+
+  /*!
+   * brief Create a unique name for I/O Var
+   */
+  std::string GetUniqueIOVarName(std::string name) {
+    if (io_var_names_.find(name) == io_var_names_.end()) {
+      io_var_names_[name] = 1;
+      return name;
+    } else {
+      io_var_names_[name] = io_var_names_[name] + 1;
+      return name + std::to_string(io_var_names_[name]);
     }
   }
 
@@ -837,6 +855,7 @@ class AOTExecutorCodegen : public MixedModeVisitor {
    * brief Run USMP to plan memory for lowered IRModule
    */
   IRModule PlanMemoryWithUSMP(const IRModule& mod) {
+    VLOG(1) << "Planning memory with USMP for module:" << std::endl << PrettyPrint(mod);
     Executor executor_config = mod->GetAttr<Executor>(tvm::attr::kExecutor).value();
     Integer workspace_byte_alignment =
         executor_config->GetAttr<Integer>("workspace-byte-alignment").value_or(16);
@@ -852,6 +871,8 @@ class AOTExecutorCodegen : public MixedModeVisitor {
       for (const tir::usmp::AllocatedPoolInfo& allocated_pool_info : allocated_pool_infos.value()) {
         for (const auto& kv : allocated_pool_info->pool_info->target_access) {
           Target tgt = kv.first;
+          VLOG(1) << "USMP requires target " << tgt->ToDebugString() << " to have pool size "
+                  << allocated_pool_info->allocated_size->value;
           if (main_func_info->workspace_sizes.find(tgt) == main_func_info->workspace_sizes.end()) {
             main_func_info->workspace_sizes.Set(tgt, allocated_pool_info->allocated_size);
           } else {
@@ -891,7 +912,7 @@ class AOTExecutorCodegen : public MixedModeVisitor {
         CalculateWorkspaceBytes(tir_main_func, workspace_byte_alignment);
     backend::FunctionInfo main_func_info =
         lowered_mod->GetAttr<backend::FunctionInfo>("main_func_info").value();
-    main_func_info->workspace_sizes.Set(target_host_, main_workspace_size_bytes);
+    main_func_info->workspace_sizes.Set(config_->host_target, main_workspace_size_bytes);
     function_metadata_.Set(runtime::symbol::tvm_module_main, main_func_info);
     return lowered_mod;
   }
@@ -911,10 +932,8 @@ class AOTExecutorCodegen : public MixedModeVisitor {
   Map<tir::Var, tir::Buffer> main_buffer_map_;
   /*! \brief maps input and output variables to TensorType which describe them */
   Map<tir::Var, TensorType> io_tensor_types_;
-  /*! \brief target device */
-  tec::TargetMap targets_;
-  /*! \brief target host */
-  Target target_host_;
+  /*! \brief All available targets. */
+  CompilationConfig config_;
   /*!
    * \brief The type of kernel call to be emitted.
    * See CallType for more documentation.
@@ -945,18 +964,15 @@ class AOTExecutorCodegen : public MixedModeVisitor {
   std::vector<tir::Stmt> stmts_;
   /*! \brief the list of return sids (note that the function might return more then one output */
   std::vector<int> return_sid_;
+  /*! \brief This is per IO var name counter to aid the generating unique names */
+  std::unordered_map<std::string, int> io_var_names_;
 
  public:
-  AOTExecutorCodegen(runtime::Module* mod, const tec::TargetMap& targets, Target target_host)
-      : mod_(mod), targets_(targets), target_host_(target_host) {}
+  AOTExecutorCodegen(runtime::Module* mod, const Array<Target>& targets)
+      : mod_(mod), config_(transform::PassContext::Current(), targets) {}
 
   LoweredOutput Codegen(IRModule mod, relay::Function func, String mod_name) {
     VLOG_CONTEXT << "AOT";
-    for (const auto& kv : targets_) {
-      VLOG(1) << "target: " << kv.second->ToDebugString();
-    }
-    ICHECK(target_host_.defined()) << "require a target_host to be given for AOT codegen";
-    VLOG(1) << "target host: " << target_host_->ToDebugString();
 
     Runtime runtime_config = mod->GetAttr<Runtime>(tvm::attr::kRuntime).value();
     Executor executor_config = mod->GetAttr<Executor>(tvm::attr::kExecutor).value();
@@ -995,9 +1011,6 @@ class AOTExecutorCodegen : public MixedModeVisitor {
                     << ") is not one of the expected values";
     }
 
-    // TODO(mbs): Plumb from compiler config
-    VirtualDevice host_virtual_device = VirtualDevice::ForTarget(target_host_);
-
     IRModule lowered_mod = tec::LowerTEPass(
         mod_name,
         [this, workspace_byte_alignment](BaseFunc func) {
@@ -1013,7 +1026,7 @@ class AOTExecutorCodegen : public MixedModeVisitor {
           // lowering process directly.
           tec::UpdateFunctionMetadata(func, this->function_metadata_, workspace_byte_alignment);
         },
-        host_virtual_device)(mod);
+        config_->host_virtual_device)(mod);
 
     auto lowered_main = lowered_mod->Lookup("main");
     auto lowered_main_func = GetRef<Function>(lowered_main.as<FunctionNode>());
@@ -1026,13 +1039,16 @@ class AOTExecutorCodegen : public MixedModeVisitor {
     // TODO(@electriclilies, @jroesch, @Mousius): remove UpdateMainWorkspaceSize
     StaticMemoryPlan memory_plan(storage_device_map_);
     backend::FunctionInfo func_info =
-        tec::UpdateMainWorkspaceSize(lowered_mod, targets_, memory_plan->expr_to_storage_info);
+        tec::UpdateMainWorkspaceSize(lowered_mod, config_, memory_plan->expr_to_storage_info);
     lowered_mod = WithAttr(lowered_mod, "main_func_info", func_info);
 
     for (auto input : lowered_main_func->params) {
       input_vars_.push_back(input);
       std::string input_name = SanitizeName(input->name_hint());
-      CreateIOVar(input, input_name);
+      // We dont want the compiler changing input names in the
+      // event of a sanitization collision. Therefore, enforcing
+      // the var created to use the input_name strictly.
+      CreateIOVar(input, input_name, /*use_unique_name = */ false);
     }
 
     // Define the storage allocator ids
@@ -1052,7 +1068,27 @@ class AOTExecutorCodegen : public MixedModeVisitor {
     // Retrieve the return sids
     return_sid_ = final_aot_allocator.GetReturnIds();
     // Insert outputs to main func signature
-    CreateIOVar(lowered_main_func->body, "output");
+    // If output tensor names were provided use them
+    if (auto opt = func->GetAttr<Array<String>>("output_tensor_names")) {
+      Array<String> output_tensor_names = opt.value();
+      if (lowered_main_func->body->IsInstance<TupleNode>()) {
+        Tuple output_tuple = Downcast<Tuple>(lowered_main_func->body);
+        for (unsigned i = 0; i < output_tuple->fields.size(); i++) {
+          // AoT Executor Codegen does not create these names,
+          // thus should be used as they are provided.
+          CreateIOVar(output_tuple->fields[i], output_tensor_names[i],
+                      /*use_unique_name = */ false);
+        }
+      } else {
+        // AoT Executor Codegen does not create these names,
+        // thus should be used as they are provided.
+        CreateIOVar(lowered_main_func->body, output_tensor_names[0], /*use_unique_name = */ false);
+      }
+    } else {
+      // If output tensor names are not provided we will generate output(x)
+      // where x is a counter to create unique names.
+      CreateIOVar(lowered_main_func->body, "output");
+    }
 
     CollectDeviceVariables(lowered_mod->GetAttr<Map<GlobalVar, String>>("device_contexts").value());
     VisitExpr(lowered_main_func->body);
@@ -1071,8 +1107,27 @@ class AOTExecutorCodegen : public MixedModeVisitor {
     // AoT Executor codegen works completely on TIR beyond this point, hence removing relay main
     // function and replacing it with its TIR version. We should try to make this a Pass.
     lowered_mod->Remove(lowered_mod->GetGlobalVar("main"));
-    auto prim_func = CreateMainFunc(mod_name, lowered_main_func->params.size());
-    lowered_mod->Update(GlobalVar(::tvm::runtime::symbol::tvm_module_main), prim_func);
+    auto tir_main_func = CreateMainFunc(mod_name, lowered_main_func->params.size());
+    // Extract additional information around main TIR PrimFunc arguments
+    Array<String> devices = ListDevices();
+    const auto main_func_params_end_iterator =
+        tir_main_func->params.begin() + tir_main_func->params.size();
+    const auto outputs_begin_iterator =
+        main_func_params_end_iterator - return_sid_.size() - devices.size();
+    Array<tir::Var> inputs = Array<tir::Var>(tir_main_func->params.begin(), outputs_begin_iterator);
+    Array<TensorType> input_tensor_types;
+    for (auto i : inputs) {
+      input_tensor_types.push_back(io_tensor_types_[i]);
+    }
+    Array<tir::Var> outputs =
+        Array<tir::Var>(outputs_begin_iterator, main_func_params_end_iterator - devices.size());
+    std::vector<String> output_var_names;
+    for (const tir::Var& output : outputs) {
+      output_var_names.push_back(output->name_hint);
+    }
+
+    Array<TensorType> output_tensor_types{final_aot_allocator.GetReturnTtypes()};
+    lowered_mod->Update(GlobalVar(::tvm::runtime::symbol::tvm_module_main), tir_main_func);
     // Parallel for loops are not supported in AoT codegen.
     lowered_mod = tir::transform::ConvertForLoopsToSerial()(lowered_mod);
 
@@ -1109,9 +1164,10 @@ class AOTExecutorCodegen : public MixedModeVisitor {
 
     ret.external_mods = external_modules.value();
 
+    // Extract USMP metadata to pass onto metadata sources
     Map<tir::Var, tir::usmp::AllocatedPoolInfo> pool_var_info;
     std::vector<tir::Var> pool_vars;
-    tir::PrimFunc tir_main_func =
+    tir_main_func =
         Downcast<tir::PrimFunc>(lowered_mod->Lookup(::tvm::runtime::symbol::tvm_module_main));
     Optional<Array<tir::usmp::AllocatedPoolInfo>> allocated_pool_infos =
         tir_main_func->GetAttr<Array<tir::usmp::AllocatedPoolInfo>>(tvm::attr::kPoolArgs);
@@ -1122,41 +1178,16 @@ class AOTExecutorCodegen : public MixedModeVisitor {
         pool_var_info.Set(tir_main_func->params[pool_var_index], allocated_pool_info);
       }
     }
-    Array<String> devices = ListDevices();
-    Array<tir::Var> inputs =
-        Array<tir::Var>(tir_main_func->params.begin(),
-                        tir_main_func->params.begin() + tir_main_func->params.size() -
-                            return_sid_.size() - pool_vars.size() - devices.size());
+    Map<String, tir::usmp::PoolAllocation> io_pool_allocations =
+        lowered_mod
+            ->GetAttr<Map<String, tir::usmp::PoolAllocation>>(tvm::attr::kIOTensorPoolAllocations)
+            .value_or({});
 
-    Array<TensorType> input_tensor_types;
-    for (auto i : inputs) {
-      input_tensor_types.push_back(io_tensor_types_[i]);
-    }
+    ret.metadata =
+        ExecutorCodegenMetadata(inputs, input_tensor_types, output_var_names, output_tensor_types,
+                                pool_vars, devices, runtime::kTvmExecutorAot, mod_name,
+                                interface_api, unpacked_api, pool_var_info, io_pool_allocations);
 
-    std::vector<String> output_var_names;
-    if (auto opt = func->GetAttr<Array<String>>("output_tensor_names")) {
-      Array<String> output_tensor_names = opt.value();
-      for (size_t i = 0; i < output_tensor_names.size(); ++i) {
-        output_var_names.push_back(output_tensor_names[i]);
-      }
-    }
-
-    // If output names have not been specified then generate default output names
-    if (output_var_names.size() == 0) {
-      if (return_sid_.size() == 1) {
-        output_var_names.push_back(String("output"));
-      } else {
-        for (size_t i = 0; i < return_sid_.size(); ++i) {
-          output_var_names.push_back(String("output" + std::to_string(i)));
-        }
-      }
-    }
-
-    Array<TensorType> output_tensor_types{final_aot_allocator.GetReturnTtypes()};
-
-    ret.metadata = ExecutorCodegenMetadata(
-        inputs, input_tensor_types, output_var_names, output_tensor_types, pool_vars, devices,
-        runtime::kTvmExecutorAot, mod_name, interface_api, unpacked_api, pool_var_info);
     return ret;
   }
 
@@ -1179,9 +1210,9 @@ class AOTExecutorCodegenModule : public runtime::ModuleNode {
     if (name == "init") {
       return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
         ICHECK_EQ(args.num_args, 2) << "The expected of arguments are: "
-                                    << "runtime::Module mod and  Map<int, Target> targets";
+                                    << "runtime::Module mod and Array<Target> targets";
         void* mod = args[0];
-        TargetMap targets = args[1];
+        Array<Target> targets = args[1];
         init(mod, targets);
       });
     } else if (name == "codegen") {
@@ -1229,22 +1260,9 @@ class AOTExecutorCodegenModule : public runtime::ModuleNode {
   const char* type_key() const final { return "RelayGraphRuntimeCodegenModule"; }
 
  private:
-  void init(void* mod, TargetMap tmp) {
-    tec::TargetMap targets;
-    Target target_host;
-    for (const auto& it : tmp) {
-      auto dev_type = it.first.as<tir::IntImmNode>();
-      // TODO(tvm-team): AoT only works with kDLCPU device type. We can remove kDLHexagon
-      // here once we refactored kDLHexagon to kDLCPU.
-      if (!target_host.defined() && ((it.second->kind->device_type == kDLCPU) ||
-                                     (it.second->kind->device_type == kDLHexagon))) {
-        target_host = it.second;
-      }
-      ICHECK(dev_type);
-      targets[static_cast<DLDeviceType>(dev_type->value)] = it.second;
-    }
-    codegen_ = std::make_shared<AOTExecutorCodegen>(reinterpret_cast<runtime::Module*>(mod),
-                                                    targets, target_host);
+  void init(void* mod, const Array<Target>& targets) {
+    codegen_ =
+        std::make_shared<AOTExecutorCodegen>(reinterpret_cast<runtime::Module*>(mod), targets);
   }
 
   Array<runtime::String> list_params_name() {
