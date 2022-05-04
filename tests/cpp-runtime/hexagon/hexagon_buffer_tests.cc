@@ -17,12 +17,10 @@
  * under the License.
  */
 
-#if defined(__hexagon__)
-
 #include <gtest/gtest.h>
 #include <tvm/runtime/container/optional.h>
 
-#include "../hexagon_buffer.h"
+#include "../src/runtime/hexagon/hexagon_buffer.h"
 
 using namespace tvm::runtime;
 using namespace tvm::runtime::hexagon;
@@ -465,5 +463,3 @@ TEST(HexagonBuffer, nd_copy_to) {
     EXPECT_EQ(data_in[i], data_out[i]);
   }
 }
-
-#endif
