@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -14,10 +15,18 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=wildcard-import, redefined-builtin, invalid-name
-"""The Relay IR namespace containing transformations."""
-# transformation passes
-from .transform import *
-from .recast import recast
-from . import fake_quantization_to_integer, mixed_precision
-from .flexible_shape import FlexibleShapeDispatch
+
+set -e
+
+
+for dir in $(ls)
+do
+  # Ignore the 3rdparty directory since we have no control of the language used there.
+  if ! [ "$dir" == "3rdparty" ]; then
+    for subdir in $(find $dir -type d -print)
+    do
+      blocklint --blocklist blacklist,whitelist,white\ box,master\ ,\ master,master_,_master,slave $subdir \
+      --skip-files tests/lint/blocklint.sh,tests/lint/pylintrc,conda/recipe/meta.yaml,rust/tvm-sys/build.rs,docs/topic/vta/dev/hardware.rst,src/target/source/codegen_vhls.cc,tests/micro/zephyr/test_utils.py
+    done
+  fi
+done
