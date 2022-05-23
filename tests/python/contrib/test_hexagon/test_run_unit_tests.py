@@ -18,21 +18,25 @@
 import os
 import pytest
 import numpy as np
-from tvm.contrib.hexagon.build import HexagonLauncher
-from .conftest import requires_hexagon_toolchain
+
+import tvm
+from tvm.contrib.hexagon.session import Session
 
 
 # use pytest -sv to observe gtest output
 # use --gtest_args to pass arguments to gtest
 # for example to run all "foo" tests twice and observe gtest output run
 # pytest -sv <this file> --gtests_args="--gtest_filter=*foo* --gtest_repeat=2"
-@requires_hexagon_toolchain
-@pytest.mark.skipif(
-    os.environ.get("HEXAGON_GTEST") == None,
-    reason="This test requires the HEXAGON_GTEST to be specified with a path to a Hexagon gtest version normally located at /path/to/hexagon/sdk/utils/googletest/gtest",
-)
-def test_run_unit_tests(hexagon_session, gtest_args):
-    func = hexagon_session._rpc.get_function("hexagon.run_unit_tests")
+@tvm.testing.requires_hexagon
+def test_run_unit_tests(hexagon_session: Session, gtest_args):
+    try:
+        func = hexagon_session._rpc.get_function("hexagon.run_unit_tests")
+    except:
+        print(
+            "This test requires TVM Runtime to be built with a Hexagon gtest version using Hexagon API cmake flag -DUSE_HEXAGON_GTEST=/path/to/hexagon/sdk/utils/googletest/gtest"
+        )
+        raise
+
     gtest_error_code_and_output = func(gtest_args)
     gtest_error_code = int(gtest_error_code_and_output.splitlines()[0])
     gtest_output = gtest_error_code_and_output.split("\n", 1)[-1]

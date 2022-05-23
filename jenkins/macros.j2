@@ -32,7 +32,7 @@
                 'PLATFORM={{ platform }}',
                 'TVM_NUM_SHARDS={{ num_shards }}',
                 'TVM_SHARD_INDEX={{ shard_index - 1 }}'], {
-                {{ caller(shard_index) | trim | indent(width=12) }}
+                {{ caller(shard_index, num_shards) | trim | indent(width=12) }}
               })
             }
           } finally {
@@ -88,4 +88,36 @@
       Utils.markStageSkippedForConditional('{{ name }}')
     }
   },
+{% endmacro %}
+
+{% macro upload_artifacts(tag, filenames, folders=None) %}
+sh(
+            script: """
+              set -eux
+              {% for filename in filenames %}
+              md5sum {{ filename }}
+              aws s3 cp --no-progress {{ filename }} s3://${s3_prefix}/{{ tag }}/{{ filename }}
+              {% endfor %}
+              {% for folder in (folders or []) %}
+              aws s3 cp --no-progress {{ folder }} s3://${s3_prefix}/{{ tag }}/{{ folder }} --recursive
+              {% endfor %}
+            """,
+            label: 'Upload artifacts to S3',
+          )
+{% endmacro %}
+
+{% macro download_artifacts(tag, filenames, folders=None) %}
+sh(
+            script: """
+              set -eux
+              {% for filename in filenames %}
+              aws s3 cp --no-progress s3://${s3_prefix}/{{ tag }}/{{ filename }} {{ filename }}
+              md5sum {{ filename }}
+              {% endfor %}
+              {% for folder in (folders or []) %}
+              aws s3 cp --no-progress s3://${s3_prefix}/{{ tag }}/{{ folder }} {{ folder }} --recursive
+              {% endfor %}
+            """,
+            label: 'Download artifacts from S3',
+          )
 {% endmacro %}
