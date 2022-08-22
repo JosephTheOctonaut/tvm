@@ -18,6 +18,7 @@
 """Arm(R) Ethos(TM)-N NPU supported operators."""
 from enum import Enum
 import warnings
+from distutils.version import LooseVersion
 
 import tvm.ir
 from tvm.relay import transform
@@ -46,8 +47,16 @@ def ethosn_available():
     return Available.SW_AND_HW if hw else Available.SW_ONLY
 
 
-def ethosn_api_version():
-    """Returns the version of the driver stack api that is being used."""
+def ethosn_api_version() -> str:
+    """
+    Returns the semantic version of the driver stack api that is
+    being used.
+
+    Returns
+    -------
+    str
+        Semantic version string (e.g. 3.0.1).
+    """
     return tvm.get_global_func("relay.ethos-n.api.version")()
 
 
@@ -79,6 +88,14 @@ def partition_for_ethosn(mod, params=None, **opts):
         )
     elif opts["variant"] != "n78":
         raise ValueError("When targeting Ethos(TM)-N78, -variant=n78 should be set.")
+
+    api_version = ethosn_api_version()
+    expected_api_version = "3.0.1"
+    if api_version != LooseVersion(expected_api_version):
+        raise ValueError(
+            f"Driver stack version {api_version} is unsupported. "
+            f"Please use version {expected_api_version}."
+        )
 
     if params:
         mod["main"] = bind_params_by_name(mod["main"], params)
@@ -153,6 +170,12 @@ def pattern_table():
         pattern = is_op("qnn.quantize")(pattern, is_constant(), is_constant())
         return pattern
 
+    def qnn_requantize_pattern():
+        pattern = is_op("qnn.requantize")(
+            wildcard(), is_constant(), is_constant(), is_constant(), is_constant()
+        )
+        return pattern
+
     def check_conv2d(extract):
         """Check if a conv2d is supported by Ethos-N."""
         if not ethosn_available():
@@ -202,6 +225,13 @@ def pattern_table():
 
         return support.leaky_relu(extract)
 
+    def check_requantize(extract):
+        """Check if requantize is supported."""
+        if not ethosn_available():
+            return False
+
+        return support.requantize(extract)
+
     return [
         ("ethos-n.qnn_conv2d", qnn_conv_pattern(), check_conv2d),
         ("ethos-n.qnn_avg_pool2d", qnn_avg_pool2d_pattern(), check_avg_pool2d),
@@ -210,6 +240,7 @@ def pattern_table():
         ("ethos-n.qnn_mean", qnn_mean_pattern(), check_mean),
         ("ethos-n.qnn_tanh", qnn_tanh_pattern(), check_tanh),
         ("ethos-n.qnn_leaky_relu", qnn_leaky_relu_pattern(), check_leaky_relu),
+        ("ethos-n.qnn_requantize", qnn_requantize_pattern(), check_requantize),
     ]
 
 
@@ -284,7 +315,7 @@ def split(expr):
     """Check if a split is supported by Ethos-N."""
     if not ethosn_available():
         return False
-    if ethosn_api_version() == 2205:
+    if ethosn_api_version() >= LooseVersion("3.0.1"):
         return False
     if not support.split(expr):
         return False

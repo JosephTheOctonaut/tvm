@@ -50,7 +50,6 @@
 #include "../../te/operation/create_primfunc.h"
 #include "../op/memory/memory.h"
 #include "../transforms/meta_schedule_layout_rewrite.h"
-#include "../transforms/pass_utils.h"
 #include "utils.h"
 
 namespace tvm {
@@ -137,8 +136,7 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
   explicit LowerToTECompute(Target target)
       : target_(target), device_copy_op_(Op::Get("device_copy")) {}
 
-  Array<te::Tensor> Lower(const Function& relay_func,
-                          std::function<std::string(std::string)> renamer) {
+  Array<te::Tensor> Lower(const Function& relay_func) {
     for (Var param : relay_func->params) {
       Array<tvm::te::Tensor> inputs;
       for (const auto& ttype : FlattenTupleType(param->checked_type())) {
@@ -327,15 +325,15 @@ class ScheduleBuilder : public ExprVisitor {
     }
   }
 
-  CachedFunc Create(const Function& relay_func, std::function<std::string(std::string)> renamer) {
+  CachedFunc Create(const Function& relay_func, GlobalVarSupply global_var_supply) {
     LowerToTECompute lower_te_compute(target_);
-    Array<te::Tensor> tensor_outs = lower_te_compute.Lower(relay_func, renamer);
+    Array<te::Tensor> tensor_outs = lower_te_compute.Lower(relay_func);
     Array<te::Tensor> fn_inputs = lower_te_compute.fn_inputs_;
     VisitExpr(relay_func->body);
 
     // TODO(mbs): This should be the definitive global by which the PrimFunc is known and
     // no other GlobalVar ctors should appear inside the lowering machinery.
-    auto prim_fn_var = GlobalVar(renamer(lower_te_compute.candidate_name_));
+    auto prim_fn_var = global_var_supply->FreshGlobal(lower_te_compute.candidate_name_);
     prim_fn_var->checked_type_ = relay_func->checked_type();
 
     // Fusion over tupled results may leave identity relationships
@@ -363,8 +361,14 @@ class ScheduleBuilder : public ExprVisitor {
       }
       if (meta_schedule_ctx_) {
         Array<te::Tensor> te_args = Concat(fn_inputs, tensor_outs);
+        Array<runtime::NDArray> constants;
+        for (auto [const_node, te_tensor] : lower_te_compute.constant_tensors_) {
+          te_args.push_back(te_tensor);
+          constants.push_back(const_node->data);
+        }
+
         if (Optional<tir::PrimFunc> tir_func =
-                meta_schedule_ctx_.value()->te_filter_func(te_args)) {
+                meta_schedule_ctx_.value()->te_filter_func(te_args, constants)) {
           IRModule relay_mod({{prim_fn_var, relay_func}});
           IRModule tir_mod({{prim_fn_var, tir_func.value()}});
           if (Optional<IRModule> opt_scheduled_mod = meta_schedule_ctx_.value()->Query(
@@ -402,8 +406,9 @@ class ScheduleBuilder : public ExprVisitor {
       }
     }
 
-    return CachedFunc(target_, prim_fn_var, fn_inputs, tensor_outs, schedule, prim_func, {},
-                      IRModule(Map<GlobalVar, BaseFunc>({})), lower_te_compute.constant_tensors_);
+    IRModule funcs = IRModule(Map<GlobalVar, BaseFunc>({}));
+    return CachedFunc(target_, prim_fn_var, fn_inputs, tensor_outs, schedule, prim_func, {}, funcs,
+                      lower_te_compute.constant_tensors_);
   }
 
   void VisitExpr_(const CallNode* call_node) final {
@@ -446,8 +451,8 @@ class ScheduleBuilder : public ExprVisitor {
  *  The funcs field in cache is not yet populated.
  */
 CachedFunc PrimFuncFor(const Function& source_func, const Target& target,
-                       std::function<std::string(std::string)> renamer) {
-  return ScheduleBuilder(target).Create(source_func, renamer);
+                       GlobalVarSupply global_var_supply) {
+  return ScheduleBuilder(target).Create(source_func, global_var_supply);
 }
 
 // Creates shape function from functor.
@@ -456,7 +461,7 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
   MakeShapeFunc() {}
 
   CachedFunc Create(const Function& prim_func, const Target& target,
-                    std::function<std::string(std::string)> renamer) {
+                    GlobalVarSupply global_var_supply) {
     VLOG_CONTEXT << "MakeShapeFunc";
     TShapeDataDependent shape_func_param_states;
 
@@ -527,8 +532,7 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
 
     // TODO(mbs): This should be the definitive global by which the PrimFunc is known and
     // no  other GlobalVar ctors should appear inside the lowering machinery.
-    auto func_name = renamer(candidate_name);
-    auto prim_fn_gvar = GlobalVar(func_name);
+    auto prim_fn_gvar = global_var_supply->FreshGlobal(candidate_name);
 
     // Gather the result types, again from the p.o.v. of the shape function rather than
     // the primitive it is derived for.
@@ -569,19 +573,10 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
     With<PassContext> fresh_pass_ctx_scope(PassContext::Create());
 
     std::unordered_map<te::Tensor, tir::Buffer> binds;
-    IRModule lowered_module = tvm::LowerSchedule(schedule, all_args, func_name, binds);
-
-    // Unfortunately the above machinery creates its own GlobalVars instead of using *the*
-    // GlobalVar we established above. Fix this before the confusion spreads any further.
-    // TODO(mbs): LowerSchedule should be given prim_fn_gvar instead of func_name.
-    IRModule fixed_lowered_module;
-    for (const auto& kv : lowered_module->functions) {
-      GlobalVar global_var =
-          kv.first->name_hint == prim_fn_gvar->name_hint ? prim_fn_gvar : kv.first;
-      fixed_lowered_module->Add(global_var, kv.second);
-    }
+    IRModule lowered_module =
+        tvm::LowerSchedule(schedule, all_args, prim_fn_gvar->name_hint, binds, global_var_supply);
     return CachedFunc(target, prim_fn_gvar, inputs, outputs, schedule, tir::PrimFunc{nullptr},
-                      shape_func_param_states, fixed_lowered_module);
+                      shape_func_param_states, lowered_module);
   }
 
   Array<te::Tensor> VisitExpr(const Expr& expr) final {
@@ -791,15 +786,14 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
 };
 
 CachedFunc ShapeFuncFor(const Function& prim_func, const Target& target,
-                        std::function<std::string(std::string)> renamer) {
-  return MakeShapeFunc().Create(prim_func, target, renamer);
+                        GlobalVarSupply global_var_supply) {
+  return MakeShapeFunc().Create(prim_func, target, global_var_supply);
 }
 
-std::pair<Array<te::Tensor>, std::string> LowerTECompute(const Function& source_func, Target target,
-                                                         bool return_inputs) {
+std::tuple<Array<te::Tensor>, Array<runtime::NDArray>, std::string> LowerTECompute(
+    const Function& source_func, Target target, bool return_inputs) {
   LowerToTECompute lower_te_compute(target);
-  Array<te::Tensor> outputs =
-      lower_te_compute.Lower(source_func, [](std::string name) { return name; });
+  Array<te::Tensor> outputs = lower_te_compute.Lower(source_func);
   // Following ScheduleBuilder, remove placeholder ops from outputs.
   tvm::Array<te::Tensor> tensor_outs;
   for (const auto& tensor : outputs) {
@@ -807,41 +801,24 @@ std::pair<Array<te::Tensor>, std::string> LowerTECompute(const Function& source_
       tensor_outs.push_back(tensor);
     }
   }
-  if (return_inputs) {
-    return std::make_pair(Concat(lower_te_compute.fn_inputs_, tensor_outs),
-                          lower_te_compute.candidate_name_);
-  }
-  return std::make_pair(tensor_outs, lower_te_compute.candidate_name_);
-}
 
-/*!
- * \brief Get unique name from name.
- * \param name The orginal name.
- * \return Updated name which is unique.
- */
-std::string GetUniqueName(std::string name, std::unordered_map<std::string, int>* name_map_) {
-  for (size_t i = 0; i < name.length(); ++i) {
-    if (name[i] == '.') name[i] = '_';
+  tvm::Array<runtime::NDArray> constants;
+  for (auto [const_node, te_tensor] : lower_te_compute.constant_tensors_) {
+    tensor_outs.push_back(te_tensor);
+    constants.push_back(const_node->data);
   }
-  while (true) {
-    auto it = name_map_->find(name);
-    if (it == name_map_->end()) {
-      (*name_map_)[name] = 1;
-      return name;
-    } else {
-      std::ostringstream os;
-      os << name << "_" << it->second;
-      ++(it->second);
-      name = os.str();
-    }
+
+  if (return_inputs) {
+    return std::make_tuple(Concat(lower_te_compute.fn_inputs_, tensor_outs), constants,
+                           lower_te_compute.candidate_name_);
   }
-  return name;
+  return std::make_tuple(tensor_outs, constants, lower_te_compute.candidate_name_);
 }
 
 TVM_REGISTER_GLOBAL("relay.backend.LowerToTE").set_body_typed([](Function prim_func) {
   auto tgt = tvm::Target("ext_dev");
   LowerToTECompute lower_te_compute(tgt);
-  auto outputs = lower_te_compute.Lower(prim_func, [&](std::string name) { return name; });
+  auto outputs = lower_te_compute.Lower(prim_func);
   return CachedFunc(tgt, GlobalVar(lower_te_compute.candidate_name_), lower_te_compute.fn_inputs_,
                     outputs, te::Schedule(), tir::PrimFunc(), {},
                     IRModule(Map<GlobalVar, BaseFunc>({})), lower_te_compute.constant_tensors_);
