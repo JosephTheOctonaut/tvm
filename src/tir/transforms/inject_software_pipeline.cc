@@ -641,6 +641,7 @@ class PipelineRewriter : public StmtExprMutator {
               // Interleaved case: the most recent async write is from the previous iteration
               producer_head_per_commit.push_back(producer_local_state.producer_head.value() - 1);
             }
+            need_wait_count[commit_group_id] = false;
           }
         }
 
