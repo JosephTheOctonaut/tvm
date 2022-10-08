@@ -516,6 +516,8 @@ class PipelineRewriter : public StmtExprMutator {
   struct AsyncStateGlobal {
     // Buffers that this stage asynchronously writes.
     std::unordered_set<const BufferNode*> dst_buffers;
+    // Buffers that this stage reads
+    std::unordered_set<const BufferNode*> src_buffers;
     // An imaginary index that the latest async operation associated with this stage has written
     // into. Only valid if all associated predicates are true, so that we can count the number of
     // async invocations exactly. When it is valid, it is the "sum of extents of loops that have
@@ -524,6 +526,7 @@ class PipelineRewriter : public StmtExprMutator {
     Optional<PrimExpr> producer_head{PrimExpr(-1)};
 
     bool writes(Buffer buf) const { return dst_buffers.count(buf.get()) > 0; }
+    bool reads(Buffer buf) const { return src_buffers.count(buf.get()) > 0; }
     // True if the corresponding stage is async
     bool is_async{false};
   };
@@ -540,7 +543,8 @@ class PipelineRewriter : public StmtExprMutator {
 
       bool valid() const { return wait_count.defined(); }
 
-      wait_info(int insert_before, PrimExpr wait_count) : insert_before(insert_before), wait_count(wait_count) {}
+      wait_info(int insert_before, PrimExpr wait_count)
+          : insert_before(insert_before), wait_count(wait_count) {}
     };
     std::list<wait_info> pending_waits;
 
@@ -581,7 +585,6 @@ class PipelineRewriter : public StmtExprMutator {
     bool is_async;
   };
 
-
   // Determine where to insert async_wait and the corresponding wait count.
   void PopulateWaitCounts(const std::vector<RewrittenBlockInfo>& new_blocks,
                           arith::Analyzer* ana_normalized,
@@ -596,7 +599,7 @@ class PipelineRewriter : public StmtExprMutator {
       }
 
       // Find all producers for this block
-      //  log in map storing { producer_stage_idx -> buffer_region }
+      //  log in map storing { producer_stage_idx -> [ buffer_regions ] }
       std::map<int, std::list<BufferRegion>> producers;
       bool any_async_producer = false;
       for (auto read_region : new_blocks[i].block->reads) {
@@ -611,17 +614,28 @@ class PipelineRewriter : public StmtExprMutator {
         }
       }
 
-      // If this block has no async producers and this block is not in an async stage, nothing to do      
+      // Find all consumers for this block
+      // Track in map of { consumer_stage_idx -> [ buffer_regions ]}
+      std::map<int, std::list<BufferRegion>> consumers;
+      for (auto write_region : new_blocks[i].block->writes) {
+        for (auto kv : async_states) {
+          if (kv.second.reads(write_region->buffer)) {
+            consumers[kv.first].push_back(write_region);
+          }
+        }
+      }
+
+      // If this block has no async producers and this block is not in an async stage, nothing to do
       if (!new_blocks[i].is_async && !any_async_producer) continue;
 
-      // For each stage on which this block depends, collect all producer heads and compute necessary guards
+      // For each stage on which this block depends, collect all producer heads and compute
+      // necessary guards
       for (auto producer : producers) {
-
         int producer_stage_idx = producer.first;
         auto& producer_local_state = (*async_states_local)[producer_stage_idx];
         const auto num_commit_group = producer_local_state.commit_groups.size();
         std::vector<Optional<PrimExpr>> producer_head_per_commit;
-        
+
         if (num_commit_group == 0) {
           // Epilogue, no async producer. Since "local" producer_head is not available, use
           // "global" producer_head.
@@ -637,7 +651,7 @@ class PipelineRewriter : public StmtExprMutator {
             if (producer_local_state.seen.count(read_region->buffer.get()) > 0) {
               // Normal case: the write has already been issued before this program point
               producer_head_per_commit.push_back(producer_local_state.producer_head.value());
-            } else{
+            } else {
               // Interleaved case: the most recent async write is from the previous iteration
               producer_head_per_commit.push_back(producer_local_state.producer_head.value() - 1);
             }
@@ -661,27 +675,62 @@ class PipelineRewriter : public StmtExprMutator {
           }
           return sum;
         }();
-      
+
         producer_local_state.pending_waits.emplace_back(static_cast<int>(i), wait_count);
       }
 
-
-
-
+      // For each stage that depends on this block, if there is an async relationship, insert buffer
+      // overwrite guard
+      for (auto consumer : consumers) {
+        int consumer_stage_idx = consumer.first;
+        auto& consumer_local_state = (*async_states_local)[consumer_stage_idx];
+        consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), 1);
+      }
     }
   }
 
-
-
-  // Given pipelined blocks and async-related information, generate final loop statements with async
-  // scopes (if any).
+  // Given pipelined blocks and async-related information, generate final loop statements with
+  // async scopes (if any).
   Array<Stmt> CompletePipelineLoopStatements(
       const std::vector<RewrittenBlockInfo>& blocks,
       const std::map<int, AsyncStateLocal>& async_states_local,
       arith::Analyzer* ana_normalized) const {
     std::vector<RewrittenBlockInfo> new_blocks = blocks;
     std::vector<int> commit_group_indices(new_blocks.size(), -1);
+
+    // lambda to insert annotations for each async_wait
+    auto attach_wait_scope = [&new_blocks, ana_normalized](int block_index, int stage_id,
+                                                           PrimExpr wait_count,
+                                                           Optional<PrimExpr> predicate) {
+      auto& block = new_blocks[block_index].block;
+      BlockNode* n = block.CopyOnWrite();
+      auto zero = make_zero(DataType::Int(32));
+      if (!predicate || (predicate && ana_normalized->CanProve(predicate.value()))) {
+        n->body =
+            AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
+                     AttrStmt(zero, tir::attr::async_wait_inflight_count, wait_count, n->body));
+      } else {
+        // Array<Stmt> stmts;
+        // auto ifstmt =
+        //     IfThenElse(predicate.value(), AttrStmt(zero, tir::attr::async_wait_queue_scope,
+        //     stage_id,
+        //                                    AttrStmt(zero, tir::attr::async_wait_inflight_count,
+        //                                             wait_count, tir::Block())));
+        // stmts.push_back(ifstmt);
+        // stmts.push_back(n->body);
+        // n->body = SeqStmt(stmts);
+        n->body = IfThenElse(
+            predicate.value(),
+            AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
+                     AttrStmt(zero, tir::attr::async_wait_inflight_count, wait_count, n->body)),
+            n->body);
+      }
+    };
+
+    LOG(ERROR) << "Printing states **";
+
     for (const auto& [stage_id, state] : async_states_local) {
+      LOG(ERROR) << "async_states_local loop, stage_id: " << stage_id;
       if (!state.commit_groups.empty()) {
         for (size_t i = 0; i < state.commit_groups.size(); ++i) {
           for (size_t j = 0; j < state.commit_groups[i].size(); ++j) {
@@ -692,30 +741,25 @@ class PipelineRewriter : public StmtExprMutator {
       }
 
       for (auto pending_wait : state.pending_waits) {
-      // if (state.pending_wait.valid()) {
-        auto attach_wait_scope = [&new_blocks](int i, int stage_id, PrimExpr wait_count) {
-          auto& block = new_blocks[i].block;
-          BlockNode* n = block.CopyOnWrite();
-          auto zero = make_zero(DataType::Int(32));
-          n->body =
-              AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
-                       AttrStmt(zero, tir::attr::async_wait_inflight_count, wait_count, n->body));
-        };
+        attach_wait_scope(pending_wait.insert_before, stage_id, pending_wait.wait_count,
+                          state.predicate);
 
-        if (state.predicate && !ana_normalized->CanProve(state.predicate.value())) {
-          // If the async operation that this wait_queue is waiting on is predicated, and we cannot
-          // prove that the predicate is always true, the precise wait count is only valid
-          // at iterations where the predicate is true;
-          auto wait_count = Call(DataType::Int(32), builtin::if_then_else(),
-                                 {state.predicate.value(), pending_wait.wait_count, 0});
-          attach_wait_scope(pending_wait.insert_before, stage_id, wait_count);
-        } else {
-          attach_wait_scope(pending_wait.insert_before, stage_id,
-                            pending_wait.wait_count);
-        }
+        // if (state.predicate && !ana_normalized->CanProve(state.predicate.value())) {
+        //   // If the async operation that this wait_queue is waiting on is predicated, and we
+        //   cannot
+        //   // prove that the predicate is always true, the precise wait count is only valid
+        //   // at iterations where the predicate is true;
+        //   // auto wait_count = Call(DataType::Int(32), builtin::if_then_else(),
+        //   //                        {state.predicate.value(), pending_wait.wait_count, 0});
+        //   attach_wait_scope(pending_wait.insert_before, stage_id, pending_wait.wait_count,
+        //   state.predicate.value());
+        // } else {
+        //   attach_wait_scope(pending_wait.insert_before, stage_id, pending_wait.wait_count);
+        // }
       }
     }
 
+    // Assemble final async blocks, including commit_queue
     Array<Stmt> stmts;
 
     for (size_t i = 0; i < new_blocks.size();) {
@@ -833,6 +877,10 @@ class PipelineRewriter : public StmtExprMutator {
       for (auto write_region : new_block->writes) {
         async_states[stage].dst_buffers.insert(write_region->buffer.get());
         buffer_to_commit_group[write_region->buffer.get()] = commit_group_id;
+      }
+
+      for (auto read_region : new_block->reads) {
+        async_states[stage].src_buffers.insert(read_region->buffer.get());
       }
 
       local_state.producer_head = normalized_access_index;
@@ -1010,9 +1058,9 @@ class PipelineInjector : private StmtExprMutator {
     if (!HasPipelineAnnotation(op)) {
       return std::move(for_node);
     }
-    // Step 2: Find the body and buffer allocations of the pipeline. The body can be direct child of
-    // the for-loop. If the for-loop has BlockRealize as its child, the pipeline body will be the
-    // child of the block.
+    // Step 2: Find the body and buffer allocations of the pipeline. The body can be direct child
+    // of the for-loop. If the for-loop has BlockRealize as its child, the pipeline body will be
+    // the child of the block.
     Stmt pipeline_body{nullptr};
     Array<Buffer> pipeline_allocs;
     if (const auto* realize = for_node->body.as<BlockRealizeNode>()) {
@@ -1125,7 +1173,8 @@ class PipelineInjector : private StmtExprMutator {
     if (it != op->annotations.end()) {
       int buffer_index = Downcast<Integer>((*it).second).IntValue();
       CHECK(buffer_index >= 0 && static_cast<size_t>(buffer_index) < op->writes.size())
-          << "ValueError: Index of the buffer exceeds the size of the write regions of the block. ("
+          << "ValueError: Index of the buffer exceeds the size of the write regions of the "
+             "block. ("
           << buffer_index << " vs. " << op->writes.size() << ")";
       double_buffers.insert(op->writes[buffer_index]->buffer);
     }
@@ -1162,7 +1211,6 @@ class PipelineInjector : private StmtExprMutator {
 }  // namespace software_pipeline
 
 namespace transform {
-
 /*!
  * \brief Transform annotated loops into pipelined one that parallelize producers and consumers.
  * \return The IR transform pass.
