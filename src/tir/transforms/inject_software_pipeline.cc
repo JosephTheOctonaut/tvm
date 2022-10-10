@@ -710,27 +710,18 @@ class PipelineRewriter : public StmtExprMutator {
             AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
                      AttrStmt(zero, tir::attr::async_wait_inflight_count, wait_count, n->body));
       } else {
-        // Array<Stmt> stmts;
-        // auto ifstmt =
-        //     IfThenElse(predicate.value(), AttrStmt(zero, tir::attr::async_wait_queue_scope,
-        //     stage_id,
-        //                                    AttrStmt(zero, tir::attr::async_wait_inflight_count,
-        //                                             wait_count, tir::Block())));
-        // stmts.push_back(ifstmt);
-        // stmts.push_back(n->body);
-        // n->body = SeqStmt(stmts);
-        n->body = IfThenElse(
-            predicate.value(),
-            AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
-                     AttrStmt(zero, tir::attr::async_wait_inflight_count, wait_count, n->body)),
-            n->body);
+        Array<Stmt> stmts;
+        auto ifstmt = IfThenElse(predicate.value(),
+                                 AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
+                                          AttrStmt(zero, tir::attr::async_wait_inflight_count,
+                                                   wait_count, tir::Evaluate(zero))));
+        stmts.push_back(ifstmt);
+        stmts.push_back(n->body);
+        n->body = SeqStmt(stmts);
       }
     };
 
-    LOG(ERROR) << "Printing states **";
-
     for (const auto& [stage_id, state] : async_states_local) {
-      LOG(ERROR) << "async_states_local loop, stage_id: " << stage_id;
       if (!state.commit_groups.empty()) {
         for (size_t i = 0; i < state.commit_groups.size(); ++i) {
           for (size_t j = 0; j < state.commit_groups[i].size(); ++j) {
@@ -743,19 +734,6 @@ class PipelineRewriter : public StmtExprMutator {
       for (auto pending_wait : state.pending_waits) {
         attach_wait_scope(pending_wait.insert_before, stage_id, pending_wait.wait_count,
                           state.predicate);
-
-        // if (state.predicate && !ana_normalized->CanProve(state.predicate.value())) {
-        //   // If the async operation that this wait_queue is waiting on is predicated, and we
-        //   cannot
-        //   // prove that the predicate is always true, the precise wait count is only valid
-        //   // at iterations where the predicate is true;
-        //   // auto wait_count = Call(DataType::Int(32), builtin::if_then_else(),
-        //   //                        {state.predicate.value(), pending_wait.wait_count, 0});
-        //   attach_wait_scope(pending_wait.insert_before, stage_id, pending_wait.wait_count,
-        //   state.predicate.value());
-        // } else {
-        //   attach_wait_scope(pending_wait.insert_before, stage_id, pending_wait.wait_count);
-        // }
       }
     }
 
