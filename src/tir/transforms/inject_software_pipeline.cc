@@ -617,16 +617,20 @@ class PipelineRewriter : public StmtExprMutator {
       // Find all consumers for this block
       // Track in map of { consumer_stage_idx -> [ buffer_regions ]}
       std::map<int, std::list<BufferRegion>> consumers;
+      bool any_async_consumer = false;
       for (auto write_region : new_blocks[i].block->writes) {
         for (auto kv : async_states) {
           if (kv.second.reads(write_region->buffer)) {
             consumers[kv.first].push_back(write_region);
+            any_async_consumer |= kv.second.is_async;
           }
         }
       }
 
       // If this block has no async producers and this block is not in an async stage, nothing to do
-      if (!new_blocks[i].is_async && !any_async_producer) continue;
+      // if (!new_blocks[i].is_async && !any_async_producer) continue;
+      // If this block has no async producers and no async consumers, nothing to do.
+      if (!any_async_producer && !any_async_consumer) continue;
 
       // For each stage on which this block depends, collect all producer heads and compute
       // necessary guards
@@ -684,7 +688,9 @@ class PipelineRewriter : public StmtExprMutator {
       for (auto consumer : consumers) {
         int consumer_stage_idx = consumer.first;
         auto& consumer_local_state = (*async_states_local)[consumer_stage_idx];
-        consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), 1);
+        if (consumer_local_state.is_async) {
+          consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), 1);  // TODO: constant 1 should be a computed value
+        }
       }
     }
   }
