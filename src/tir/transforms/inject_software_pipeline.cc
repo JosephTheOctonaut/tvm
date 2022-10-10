@@ -634,6 +634,7 @@ class PipelineRewriter : public StmtExprMutator {
       // necessary guards
       for (auto producer : producers) {
         int producer_stage_idx = producer.first;
+        if (!async_states[producer_stage_idx].is_async) continue;  // Nothing to do if the producer is synchronous
         auto& producer_local_state = (*async_states_local)[producer_stage_idx];
         const auto num_commit_group = producer_local_state.commit_groups.size();
         std::vector<Optional<PrimExpr>> producer_head_per_commit;
@@ -728,6 +729,8 @@ class PipelineRewriter : public StmtExprMutator {
     };
 
     for (const auto& [stage_id, state] : async_states_local) {
+      // if (!async_states[stage_id].is_async) continue;
+      if (!async_states.at(stage_id).is_async) continue;
       if (!state.commit_groups.empty()) {
         for (size_t i = 0; i < state.commit_groups.size(); ++i) {
           for (size_t j = 0; j < state.commit_groups[i].size(); ++j) {
