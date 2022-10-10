@@ -572,8 +572,6 @@ class PipelineRewriter : public StmtExprMutator {
 
     // This is set to true when we reach a stage that consumes this async stage.
     bool consumed{false};
-    // True if the corresponding stage is async
-    bool is_async{false};
   };
 
   /*! Structure holding intermediate information for pipeline loop rewriting. */
@@ -688,8 +686,10 @@ class PipelineRewriter : public StmtExprMutator {
       for (auto consumer : consumers) {
         int consumer_stage_idx = consumer.first;
         auto& consumer_local_state = (*async_states_local)[consumer_stage_idx];
-        if (consumer_local_state.is_async) {
-          consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), 1);  // TODO: constant 1 should be a computed value
+        auto& consumer_global_state = (async_states)[consumer_stage_idx];
+        if (consumer_global_state.is_async) {
+          consumer_local_state.pending_waits.emplace_back(
+              static_cast<int>(i), 1);  // TODO: constant 1 should be a computed value
         }
       }
     }
@@ -836,8 +836,9 @@ class PipelineRewriter : public StmtExprMutator {
       new_block = Downcast<Block>(
           Substitute(new_block, {{pipeline_loop_->loop_var, normalized_access_index}}));
 
+      async_states[stage].is_async = pipeline_info_.at(block).async;
+
       auto& local_state = async_states_local[stage];
-      local_state.is_async = pipeline_info_[block].async;
 
       int commit_group_id = -1;
       if (local_state.commit_groups.empty() || local_state.consumed) {
@@ -878,10 +879,10 @@ class PipelineRewriter : public StmtExprMutator {
       if (pipeline_info_[block].async) {
         BlockNode* n = new_block.CopyOnWrite();
         n->body = AttrStmt(make_zero(DataType::Int(32)), tir::attr::async_scope, 1, n->body);
-
-        new_blocks.push_back(
-            {stage, inbound, new_block, normalized_access_index, pipeline_info_[block].async});
       }
+
+      new_blocks.push_back(
+          {stage, inbound, new_block, normalized_access_index, pipeline_info_[block].async});
 
       for (auto read_region : new_block->reads) {
         for (auto kv : async_states) {
