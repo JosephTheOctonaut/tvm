@@ -634,7 +634,8 @@ class PipelineRewriter : public StmtExprMutator {
       // necessary guards
       for (auto producer : producers) {
         int producer_stage_idx = producer.first;
-        if (!async_states[producer_stage_idx].is_async) continue;  // Nothing to do if the producer is synchronous
+        if (!async_states[producer_stage_idx].is_async)
+          continue;  // Nothing to do if the producer is synchronous
         auto& producer_local_state = (*async_states_local)[producer_stage_idx];
         const auto num_commit_group = producer_local_state.commit_groups.size();
         std::vector<Optional<PrimExpr>> producer_head_per_commit;
@@ -683,14 +684,26 @@ class PipelineRewriter : public StmtExprMutator {
       }
 
       // For each stage that depends on this block, if there is an async relationship, insert buffer
-      // overwrite guard
+      // overwrite guard. We only need the strictest guard.
       for (auto consumer : consumers) {
         int consumer_stage_idx = consumer.first;
         auto& consumer_local_state = (*async_states_local)[consumer_stage_idx];
         auto& consumer_global_state = (async_states)[consumer_stage_idx];
         if (consumer_global_state.is_async) {
-          consumer_local_state.pending_waits.emplace_back(
-              static_cast<int>(i), 1);  // TODO: constant 1 should be a computed value
+          PrimExpr wait_count;  // if there are multiple buffers, find the strictest wait count
+          for (BufferRegion consumer_region : consumer.second) {
+            auto num_slices = consumer_region.get()->buffer->shape[0];  // buffer duplication factor
+            auto stage_offset =
+                new_blocks[i].access_index - consumer_local_state.producer_head.value();
+            // num_slices is max number of ops (read and write) that can be in-flight for the
+            // buffer. stage_offset + 1 is the number of writes that have been dispatched (including
+            // this iteration). Difference is the "free" slices that the reader can be working on.
+            auto count = analyzer_.Simplify(num_slices - stage_offset - 1);
+            if (!wait_count.defined() || !analyzer_.CanProve(wait_count <= count)) {
+              wait_count = count;
+            }
+          }
+          consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), wait_count);
         }
       }
     }
