@@ -700,8 +700,12 @@ class PipelineRewriter : public StmtExprMutator {
             // this iteration). Difference is the "free" slices that the reader can be working on.
             auto count = analyzer_.Simplify(num_slices - stage_offset - 1);
             if (!wait_count.defined() || !analyzer_.CanProve(wait_count <= count)) {
-              wait_count = count;
+              wait_count = count;  // Keep the most conservative (lowest) wait count
             }
+          }
+          if (!analyzer_.CanProve(wait_count >= 0)) {
+            // if we don't know the wait count statically, default to most conservative (zero)
+            wait_count = PrimExpr(0);
           }
           consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), wait_count);
         }
