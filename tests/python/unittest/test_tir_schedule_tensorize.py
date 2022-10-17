@@ -36,9 +36,9 @@ from tvm.tir.tensor_intrin.x86 import VNNI_DOT_16x4_INTRIN
 
 @T.prim_func
 def mma_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (16, 16), align=128, offset_factor=1)
-    B = T.match_buffer(b, (16, 16), align=128, offset_factor=1)
-    C = T.match_buffer(c, (16, 16), align=128, offset_factor=1)
+    A = T.match_buffer(a, (16, 16), align=64, offset_factor=1)
+    B = T.match_buffer(b, (16, 16), align=64, offset_factor=1)
+    C = T.match_buffer(c, (16, 16), align=64, offset_factor=1)
 
     with T.block("root"):
         T.reads(C[0 : 16, 0 : 16], A[0 : 16, 0 : 16], B[0 : 16, 0 : 16])
@@ -51,9 +51,9 @@ def mma_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
 
 @T.prim_func
 def mma_intrin(a: T.handle, b: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (16, 16), align=128, offset_factor=1)
-    B = T.match_buffer(b, (16, 16), align=128, offset_factor=1)
-    C = T.match_buffer(c, (16, 16), align=128, offset_factor=1)
+    A = T.match_buffer(a, (16, 16), align=64, offset_factor=1)
+    B = T.match_buffer(b, (16, 16), align=64, offset_factor=1)
+    C = T.match_buffer(c, (16, 16), align=64, offset_factor=1)
 
     with T.block("root"):
         T.reads(C[0 : 16, 0 : 16], A[0 : 16, 0 : 16], B[0 : 16, 0 : 16])
@@ -173,9 +173,9 @@ def matmul(
 
 @T.prim_func
 def tensorized_matmul(a: T.handle, b: T.handle, c: T.handle) -> None:
-    C = T.match_buffer(c, [128, 128], elem_offset=0, align=128, offset_factor=1)
-    B = T.match_buffer(b, [128, 128], elem_offset=0, align=128, offset_factor=1)
-    A = T.match_buffer(a, [128, 128], elem_offset=0, align=128, offset_factor=1)
+    C = T.match_buffer(c, [128, 128], elem_offset=0, align=64, offset_factor=1)
+    B = T.match_buffer(b, [128, 128], elem_offset=0, align=64, offset_factor=1)
+    A = T.match_buffer(a, [128, 128], elem_offset=0, align=64, offset_factor=1)
 
     for i_outer, j_outer in T.grid(8, 8):
         for i_inner_init, j_inner_init in T.grid(16, 16):
@@ -375,9 +375,9 @@ def tensorized_batch_matmul_outer_product(
 
 @T.prim_func
 def annotated_mma_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
-    A = T.match_buffer(a, (16, 16), align=128, offset_factor=1)
-    B = T.match_buffer(b, (16, 16), align=128, offset_factor=1)
-    C = T.match_buffer(c, (16, 16), align=128, offset_factor=1)
+    A = T.match_buffer(a, (16, 16), align=64, offset_factor=1)
+    B = T.match_buffer(b, (16, 16), align=64, offset_factor=1)
+    C = T.match_buffer(c, (16, 16), align=64, offset_factor=1)
 
     with T.block("root"):
         T.reads(C[0 : 16, 0 : 16], A[0 : 16, 0 : 16], B[0 : 16, 0 : 16])
@@ -406,9 +406,9 @@ def annotated_matmul(
 
 @T.prim_func
 def annotated_tensorized_matmul(a: T.handle, b: T.handle, c: T.handle) -> None:
-    C = T.match_buffer(c, [128, 128], elem_offset=0, align=128, offset_factor=1)
-    B = T.match_buffer(b, [128, 128], elem_offset=0, align=128, offset_factor=1)
-    A = T.match_buffer(a, [128, 128], elem_offset=0, align=128, offset_factor=1)
+    C = T.match_buffer(c, [128, 128], elem_offset=0, align=64, offset_factor=1)
+    B = T.match_buffer(b, [128, 128], elem_offset=0, align=64, offset_factor=1)
+    A = T.match_buffer(a, [128, 128], elem_offset=0, align=64, offset_factor=1)
 
     for i_outer, j_outer in T.grid(8, 8):
         for i_inner_init, j_inner_init in T.grid(16, 16):
@@ -644,6 +644,98 @@ def test_tensorize_dpa4():
         sch.tensorize(ki, intrin)
 
         verify_trace_roundtrip(sch=sch, mod=func)
+
+
+def test_tensor_intrin_look_up():
+    intrin_name = 'non_existent_intrin'
+    assert tir.TensorIntrin.get(intrin_name, allow_missing=True) is None
+    with pytest.raises(ValueError):
+        tir.TensorIntrin.get(intrin_name)
+
+
+def test_tensorize_matmul_mixed_dtype():
+    # fmt: off
+    @T.prim_func
+    def matmul_int64_shape(
+        A: T.Buffer[(T.int64(128), T.int64(128)), "float32"],
+        B: T.Buffer[(T.int64(128), T.int64(128)), "float32"],
+        C: T.Buffer[(T.int64(128), T.int64(128)), "float32"]
+    ) -> None:
+        for i_0, j_0 in T.grid(T.int64(8), T.int64(8)):
+            for i_1_init, j_1_init in T.grid(T.int64(16), T.int64(16)):
+                with T.block("init"):
+                    vi = T.axis.spatial(T.int64(128), i_0 * T.int64(16) + i_1_init)
+                    vj = T.axis.spatial(T.int64(128), j_0 * T.int64(16) + j_1_init)
+                    C[vi, vj] = T.float32(0)
+            for k_0, i_1, j_1, k_1 in T.grid(T.int64(8), T.int64(16), T.int64(16), T.int64(16)):
+                with T.block("update"):
+                    vi = T.axis.spatial(T.int64(128), i_0 * T.int64(16) + i_1)
+                    vj = T.axis.spatial(T.int64(128), j_0 * T.int64(16) + j_1)
+                    vk = T.axis.reduce(T.int64(128), k_0 * T.int64(16) + k_1)
+                    C[vi, vj] = C[vi, vj] + A[vi, vk] * B[vj, vk]
+
+    @T.prim_func
+    def tensorized_matmul_int64_shape(
+        A: T.Buffer[(T.int64(128), T.int64(128)), "float32"],
+        B: T.Buffer[(T.int64(128), T.int64(128)), "float32"],
+        C: T.Buffer[(T.int64(128), T.int64(128)), "float32"]
+    ) -> None:
+        for i_outer, j_outer in T.grid(T.int64(8), T.int64(8)):
+            for i_inner_init, j_inner_init in T.grid(T.int64(16), T.int64(16)):
+                with T.block("init"):
+                    vi = T.axis.spatial(T.int64(128), i_outer * T.int64(16) + i_inner_init)
+                    vj = T.axis.spatial(T.int64(128), j_outer * T.int64(16) + j_inner_init)
+                    C[vi, vj] = T.float32(0)
+            for k_outer in T.grid(T.int64(8)):
+                with T.block("update"):
+                    vi, vj, vk = T.axis.remap("SSR", [i_outer, j_outer, k_outer])
+                    T.reads(
+                        [
+                            C[vi * T.int64(16) : vi * T.int64(16) + T.int64(16), vj * T.int64(16) : vj * T.int64(16) + T.int64(16)],
+                            A[vi * T.int64(16) : vi * T.int64(16) + T.int64(16), vk * T.int64(16) : vk * T.int64(16) + T.int64(16)],
+                            B[vj * T.int64(16) : vj * T.int64(16) + T.int64(16), vk * T.int64(16) : vk * T.int64(16) + T.int64(16)],
+                        ]
+                    )
+                    T.writes(C[vi * T.int64(16) : vi * T.int64(16) + T.int64(16), vj * T.int64(16) : vj * T.int64(16) + T.int64(16)])
+                    A_elem_offset = T.var("int32")
+                    B_elem_offset = T.var("int32")
+                    C_elem_offset = T.var("int32")
+                    A_sub = T.match_buffer(
+                        A[vi * T.int64(16) : vi * T.int64(16) + T.int64(16), vk * T.int64(16) : vk * T.int64(16) + T.int64(16)],
+                        [16, 16],
+                        elem_offset=A_elem_offset,
+                    )
+                    B_sub = T.match_buffer(
+                        B[vj * T.int64(16) : vj * T.int64(16) + T.int64(16), vk * T.int64(16) : vk * T.int64(16) + T.int64(16)],
+                        [16, 16],
+                        elem_offset=B_elem_offset,
+                    )
+                    C_sub = T.match_buffer(
+                        C[vi * T.int64(16) : vi * T.int64(16) + T.int64(16), vj * T.int64(16) : vj * T.int64(16) + T.int64(16)],
+                        [16, 16],
+                        elem_offset=C_elem_offset,
+                    )
+                    T.evaluate(
+                        T.tvm_mma_sync(
+                            C_sub.data,
+                            T.floordiv(C_sub.elem_offset, 256),
+                            A_sub.data,
+                            T.floordiv(A_sub.elem_offset, 256),
+                            B_sub.data,
+                            T.floordiv(B_sub.elem_offset, 256),
+                            C_sub.data,
+                            T.floordiv(C_sub.elem_offset, 256),
+                            dtype="handle",
+                        )
+                    )
+    # fmt: on
+
+    s = tir.Schedule(matmul_int64_shape, debug_mask="all")
+    update = s.get_block("update")
+    ii = s.get_loops(update)[-3]
+    s.tensorize(ii, "test_mma_intrin")
+    tvm.ir.assert_structural_equal(s.mod["main"], tensorized_matmul_int64_shape)
+    verify_trace_roundtrip(sch=s, mod=matmul_int64_shape)
 
 
 if __name__ == "__main__":

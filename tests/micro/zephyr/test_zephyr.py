@@ -32,7 +32,6 @@ from tvm.relay.backend import Executor, Runtime
 from tvm.relay.testing import byoc
 from tvm.contrib import utils
 from tvm.micro.testing.utils import check_tune_log
-from tvm.target import arm_isa
 
 import test_utils
 
@@ -60,7 +59,7 @@ def _make_session(temp_dir, zephyr_board, west_cmd, mod, build_config, use_fvp):
         "project_type": "host_driven",
         "west_cmd": west_cmd,
         "verbose": bool(build_config.get("debug")),
-        "zephyr_board": zephyr_board,
+        "board": zephyr_board,
         "arm_fvp_path": "/opt/arm/FVP_Corstone_SSE-300/models/Linux64_GCC-6.4/FVP_Corstone_SSE-300_Ethos-U55",
         "use_fvp": bool(use_fvp),
     }
@@ -457,7 +456,7 @@ def test_autotune_conv2d(workspace_dir, board, west_cmd, microtvm_debug, use_fvp
         config_main_stack_size = 1536
 
     project_options = {
-        "zephyr_board": board,
+        "board": board,
         "west_cmd": west_cmd,
         "verbose": 1,
         "project_type": "host_driven",
@@ -549,8 +548,7 @@ def test_schedule_build_with_cmsis_dependency(
     build_config = {"debug": microtvm_debug}
     target = tvm.target.target.micro(model, options=["-keys=arm_cpu,cpu"])
 
-    isa = arm_isa.IsaAnalyzer(target)
-    if not isa.has_dsp_support:
+    if not target.features.has_dsp:
         pytest.skip(f"ISA does not support DSP. target: {target}")
 
     # Create a Relay conv2d
@@ -579,7 +577,7 @@ def test_schedule_build_with_cmsis_dependency(
         "project_type": "host_driven",
         "west_cmd": west_cmd,
         "verbose": bool(build_config.get("debug")),
-        "zephyr_board": board,
+        "board": board,
         "cmsis_path": os.getenv("CMSIS_PATH"),
         "use_fvp": bool(use_fvp),
     }

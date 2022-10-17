@@ -117,6 +117,8 @@ class StorageInfo : private transform::DeviceAwareExprVisitor {
   }
 
  private:
+  using transform::DeviceAwareExprVisitor::VisitExpr_;
+
   void Visit(const Expr& expr) {
     // Pre-order traversal to enable upward propagation
     // of consumer storage scopes to producers when desirable.
@@ -426,6 +428,8 @@ class RewriteVDStorageScopes : public transform::DeviceAwareExprMutator {
   using VarMap = std::unordered_map<Expr, Var, ObjectPtrHash, ObjectPtrEqual>;
 
  public:
+  using transform::DeviceAwareExprMutator::VisitExpr_;
+
   explicit RewriteVDStorageScopes(const Map<Expr, Map<Expr, Array<String>>>& storage_scope)
       : transform::DeviceAwareExprMutator(Optional<IRModule>()), storage_scope_(storage_scope) {}
 
@@ -440,7 +444,7 @@ class RewriteVDStorageScopes : public transform::DeviceAwareExprMutator {
       c->virtual_device_ =
           VirtualDevice(virtual_device->device_type(), virtual_device->virtual_device_id,
                         virtual_device->target, storage_scope_[GetRef<Expr>(vn)][Expr()][0]);
-      return c;
+      return std::move(c);
     }
     return GetRef<Var>(vn);
   }
@@ -516,7 +520,7 @@ class RewriteVDStorageScopes : public transform::DeviceAwareExprMutator {
                                  virtual_device->target, memory_scope),
                    true);
     }
-    return new_call;
+    return std::move(new_call);
   }
 
  private:
