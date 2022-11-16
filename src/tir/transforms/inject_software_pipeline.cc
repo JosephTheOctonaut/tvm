@@ -735,19 +735,24 @@ class PipelineRewriter : public StmtExprMutator {
       auto& block = new_blocks[block_index].block;
       BlockNode* n = block.CopyOnWrite();
       auto zero = make_zero(DataType::Int(32));
-      if (!predicate || (predicate && ana_normalized->CanProve(predicate.value()))) {
+      if (!predicate || (predicate && ana_normalized->CanProve(predicate.value())) || (ana_normalized->CanProve(wait_count == 0))) {
         n->body =
             AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
                      AttrStmt(zero, tir::attr::async_wait_inflight_count, wait_count, n->body));
       } else {
         Array<Stmt> stmts;
-        auto ifstmt = IfThenElse(predicate.value(),
-                                 AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
-                                          AttrStmt(zero, tir::attr::async_wait_inflight_count,
-                                                   wait_count, tir::Evaluate(zero))));
-        stmts.push_back(ifstmt);
-        stmts.push_back(n->body);
-        n->body = SeqStmt(stmts);
+        // auto ifstmt = IfThenElse(predicate.value(),
+        //                          AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
+        //                                   AttrStmt(zero, tir::attr::async_wait_inflight_count,
+        //                                            wait_count, tir::Evaluate(zero))));
+        // stmts.push_back(ifstmt);
+        // stmts.push_back(n->body);
+        // n->body = SeqStmt(stmts);
+        auto predicated_count =
+            Call(DataType::Int(32), builtin::if_then_else(), {predicate.value(), wait_count, zero});
+        n->body = AttrStmt(
+            zero, tir::attr::async_wait_queue_scope, stage_id,
+            AttrStmt(zero, tir::attr::async_wait_inflight_count, predicated_count, n->body));
       }
     };
 
@@ -874,21 +879,21 @@ class PipelineRewriter : public StmtExprMutator {
 
       auto& local_state = async_states_local[stage];
 
-        int commit_group_id = -1;
-        if (local_state.commit_groups.empty() || local_state.consumed ||
-            !merge_async_commit_queue_scope_) {
-          // consumed == true means there is already a consumer stage waiting for an
-          // eariler async operation of this stage. In such cases, we make multiple commit_queue
-          // for this stage.
-          commit_group_id = local_state.commit_groups.size();
-          local_state.commit_groups.push_back({new_blocks.size()});
-        } else {
-          // This is the case when one commit_queue groups multiple async blocks.
-          // with commit_queue(stage):
-          //   async_scope:
-          //     A_shared[...] = ...
-          //   async_scope:
-          //     B_shared[...] = ...
+      int commit_group_id = -1;
+      if (local_state.commit_groups.empty() || local_state.consumed ||
+          !merge_async_commit_queue_scope_) {
+        // consumed == true means there is already a consumer stage waiting for an
+        // eariler async operation of this stage. In such cases, we make multiple commit_queue
+        // for this stage.
+        commit_group_id = local_state.commit_groups.size();
+        local_state.commit_groups.push_back({new_blocks.size()});
+      } else {
+        // This is the case when one commit_queue groups multiple async blocks.
+        // with commit_queue(stage):
+        //   async_scope:
+        //     A_shared[...] = ...
+        //   async_scope:
+        //     B_shared[...] = ...
 
         commit_group_id = local_state.commit_groups.size() - 1;
         local_state.commit_groups.back().push_back(new_blocks.size());
