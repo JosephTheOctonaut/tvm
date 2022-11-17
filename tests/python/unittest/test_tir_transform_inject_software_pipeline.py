@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from typing import Mapping
 import pytest
 import sys
 import numpy as np
@@ -1346,8 +1347,10 @@ def test_three_stage_compute_two_stage_async():
                             T.reads(A[tx, i])
                             T.writes(B[i % 2, tx, 0])
                             with T.attr(0, "async_commit_queue_scope", 0):
-                                with T.attr(0, "async_scope", 1):
-                                    B[i % 2, tx, 0] = A[tx, i] * T.float32(2)
+                                    with T.attr(0, "async_wait_queue_scope", 1):
+                                        with T.attr(0, "async_wait_inflight_count", 0):
+                                            with T.attr(0, "async_scope", 1):
+                                                B[i % 2, tx, 0] = A[tx, i] * T.float32(2)
                         with T.block():
                             T.where(1 <= i and i - 1 < 16)
                             T.reads(B[(i + 1) % 2, tx, 0])
@@ -1368,8 +1371,10 @@ def test_three_stage_compute_two_stage_async():
                             T.reads(A[tx, i + 2])
                             T.writes(B[i % 2, tx, 0])
                             with T.attr(0, "async_commit_queue_scope", 0):
-                                with T.attr(0, "async_scope", 1):
-                                    B[(i + 2) % 2, tx, 0] = A[tx, i + 2] * T.float32(2)
+                                with T.attr(0, "async_wait_queue_scope", 1):
+                                    with T.attr(0, "async_wait_inflight_count", 0):
+                                        with T.attr(0, "async_scope", 1):
+                                            B[(i + 2) % 2, tx, 0] = A[tx, i + 2] * T.float32(2)
                         with T.block():
                             T.where(i + 2 - 1 < 16)
                             T.reads(B[(i + 1) % 2, tx, 0])
@@ -1408,15 +1413,117 @@ def test_three_stage_compute_two_stage_async():
                             T.reads(C[0:2, tx, 0])
                             T.writes(D[tx, i - 2 + 16])
                             with T.attr(0, "async_wait_queue_scope", 1):
-                                with T.attr(
-                                    0,
-                                    "async_wait_inflight_count",
-                                    T.if_then_else(i + 16 - 1 < 16, 1, 0, dtype="int32"),
-                                ):
+                                with T.attr(0, "async_wait_inflight_count", T.if_then_else(i + 16 - 1 < 16, 1, 0, dtype="int32")):
                                     D[tx, i - 2 + 16] = C[(i - 2 + 16) % 2, tx, 0] + T.float32(1)
 
     tvm.ir.assert_structural_equal(mod["main"], ref, True)
 
+def test_three_stage_compute_three_stage_async():
+    mod = tvm.IRModule.from_expr(three_stage_compute)
+    sch = tvm.tir.Schedule(mod)
+
+    _, loop = sch.get_loops(sch.get_block("compute"))
+    sch.annotate(loop, ann_key="software_pipeline_async_stages", ann_val=[0, 1, 2])
+
+    mod = tvm.tir.transform.InjectSoftwarePipeline()(sch.mod)
+
+    @T.prim_func
+    def ref(A: T.Buffer[(16, 16), "float32"], D: T.Buffer[(16, 16), "float32"]) -> None:
+        for tx in T.thread_binding(16, thread="threadIdx.x"):
+            with T.block():
+                T.reads(A[tx, 0:16])
+                T.writes(D[tx, 0:16])
+                B = T.alloc_buffer([2, 16, 1], dtype="float32", scope="shared")
+                C = T.alloc_buffer([2, 16, 1], dtype="float32", scope="shared")
+                with T.block():
+                    T.reads(A[tx, 0:2], B[0:2, tx, 0])
+                    T.writes(B[0:2, tx, 0], C[0:2, tx, 0])
+                    for i in T.unroll(2):
+                        with T.block():
+                            T.where(i < 16)
+                            T.reads(A[tx, i])
+                            T.writes(B[i % 2, tx, 0])
+                            with T.attr(0, "async_commit_queue_scope", 0):
+                                    with T.attr(0, "async_wait_queue_scope", 1):
+                                        with T.attr(0, "async_wait_inflight_count", 0):
+                                            with T.attr(0, "async_scope", 1):
+                                                B[i % 2, tx, 0] = A[tx, i] * T.float32(2)
+                        with T.block():
+                            T.where(1 <= i and i - 1 < 16)
+                            T.reads(B[(i + 1) % 2, tx, 0])
+                            T.writes(C[(i + 1) % 2, tx, 0])
+                            with T.attr(0, "async_commit_queue_scope", 1):
+                                with T.attr(0, "async_wait_queue_scope", 0):
+                                    with T.attr(0, "async_wait_inflight_count", 1):
+                                        with T.attr(0, "async_scope", 1):
+                                            C[(i - 1) % 2, tx, 0] = B[
+                                                (i - 1) % 2, tx, 0
+                                            ] + T.float32(2)
+                with T.block():
+                    T.reads(A[tx, 2:16], B[0:2, tx, 0], C[0:2, tx, 0])
+                    T.writes(B[0:2, tx, 0], C[0:2, tx, 0], D[tx, 0:14])
+                    for i in T.serial(14):
+                        with T.block():
+                            T.where(i + 2 < 16)
+                            T.reads(A[tx, i + 2])
+                            T.writes(B[i % 2, tx, 0])
+                            with T.attr(0, "async_commit_queue_scope", 0):
+                                with T.attr(0, "async_wait_queue_scope", 1):
+                                    with T.attr(0, "async_wait_inflight_count", 0):
+                                        with T.attr(0, "async_scope", 1):
+                                            B[(i + 2) % 2, tx, 0] = A[tx, i + 2] * T.float32(2)
+                        with T.block():
+                            T.where(i + 2 - 1 < 16)
+                            T.reads(B[(i + 1) % 2, tx, 0])
+                            T.writes(C[(i + 1) % 2, tx, 0])
+                            with T.attr(0, "async_commit_queue_scope", 1):
+                                with T.attr(0, "async_wait_queue_scope", 2):
+                                    with T.attr(0, "async_wait_inflight_count", 0):
+                                        with T.attr(0, "async_wait_queue_scope", 0):
+                                            with T.attr(0, "async_wait_inflight_count", 1):
+                                                with T.attr(0, "async_scope", 1):
+                                                    C[(i - 1 + 2) % 2, tx, 0] = B[
+                                                        (i - 1 + 2) % 2, tx, 0
+                                                    ] + T.float32(2)
+                        with T.block():
+                            T.where(i + 2 - 2 < 16)
+                            T.reads(C[i % 2, tx, 0])
+                            T.writes(D[tx, i])
+                            with T.attr(0, "async_commit_queue_scope", 2):
+                                with T.attr(0, "async_wait_queue_scope", 1):
+                                    with T.attr(0, "async_wait_inflight_count", 1):
+                                        with T.attr(0, "async_scope", 1):
+                                            D[tx, i - 2 + 2] = C[(i - 2 + 2) % 2, tx, 0] + T.float32(1)
+                with T.block():
+                    T.reads(B[0:2, tx, 0], C[0:2, tx, 0])
+                    T.writes(C[0:2, tx, 0], D[tx, 14:16])
+                    for i in T.unroll(2):
+                        with T.block():
+                            T.where(i + 16 - 1 < 16)
+                            T.reads(B[(i + 1) % 2, tx, 0])
+                            T.writes(C[(i + 1) % 2, tx, 0])
+                            with T.attr(0, "async_commit_queue_scope", 1):
+                                with T.attr(0, "async_wait_queue_scope", 2):
+                                    with T.attr(0, "async_wait_inflight_count", 0):
+                                        with T.attr(0, "async_wait_queue_scope", 0):
+                                            with T.attr(0, "async_wait_inflight_count", 0 - i):
+                                                with T.attr(0, "async_scope", 1):
+                                                    C[(i - 1 + 16) % 2, tx, 0] = B[
+                                                        (i - 1 + 16) % 2, tx, 0
+                                                    ] + T.float32(2)
+                        with T.block():
+                            T.where(i + 16 - 2 < 16)
+                            T.reads(C[i % 2, tx, 0])
+                            T.writes(D[tx, i + 14])
+                            with T.attr(0, "async_commit_queue_scope", 2):
+                                with T.attr(0, "async_wait_queue_scope", 1):
+                                    with T.attr(0, "async_wait_inflight_count", T.if_then_else(i + 16 - 1 < 16, 1, 0, dtype="int32")):
+                                        with T.attr(0, "async_scope", 1):
+                                            D[tx, i - 2 + 16] = C[(i - 2 + 16) % 2, tx, 0] + T.float32(1)
+
+    print("TRANSFORMED:/n", mod["main"].script())
+    print("REFERENCE:/n", ref.script())
+    tvm.ir.assert_structural_equal(mod["main"], ref, True)
 
 N = K = M = 4096
 
