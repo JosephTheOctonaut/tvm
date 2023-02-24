@@ -1505,6 +1505,26 @@ constexpr const char* async_wait_queue_scope = "async_wait_queue_scope";
 constexpr const char* async_wait_inflight_count = "async_wait_inflight_count";
 
 /*!
+ * \brief Token-based asynchronous annotations.
+ *
+ * Synchronization is done in terms of "queue", as above, and re-uses the async_commit_queue
+ * annotation. Unlike the in-flight counting, synchronization here is done with unique token
+ * integers. Every asynchronous block will have an async_commit_queue, and will likely have
+ * async_signal_token and/or async_wait_token.
+ *
+ * async_commit_queue(i): (As above) Group the operations in the block into an asynchronous chunk
+ * and send them to queue i.
+ *
+ * async_signal_token(i): When the operations in this asynchronous chunk have finished, signal to
+ * token i that the data is ready.
+ *
+ * async_wait_token(i): Stall (block) execution of the asynchronous block until token i has been
+ * signaled.
+ */
+constexpr const char* async_signal_token = "async_signal_token";
+constexpr const char* async_wait_token = "async_wait_token";
+
+/*!
  * \brief Mark that the shape of TensorCore fragment
  */
 constexpr const char* fragment_shape = "fragment_shape";

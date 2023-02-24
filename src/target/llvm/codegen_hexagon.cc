@@ -73,7 +73,9 @@ class CodeGenHexagon final : public CodeGenCPU {
             bool dynamic_lookup, bool target_c_runtime) override;
   void InitTarget() final;
 
-  using CodeGenCPU::VisitStmt_;
+  // using CodeGenCPU::VisitStmt_;
+  void VisitStmt_(const AttrStmtNode* op) override;
+
   llvm::Value* VisitExpr_(const BufferLoadNode* op) override;
 
   llvm::Value* CreateCallExtern(Type ret_type, String global_symbol, const Array<PrimExpr>& args,
@@ -109,6 +111,9 @@ class CodeGenHexagon final : public CodeGenCPU {
       "tvm_vect_qhmath_hvx_sqrt_ahf",    "tvm_vect_qhmath_hvx_exp_ahf",
       "tvm_vect_qhmath_hvx_tan_ahf",     "tvm_vect_qhmath_hvx_floor_ahf",
       "tvm_vect_qhmath_hvx_ceil_ahf",    "tvm_vect_qhmath_hvx_pow_ahf"};
+  PrimExpr async_queue = -1;
+  std::vector<PrimExpr> wait_tokens;
+  std::vector<PrimExpr> signal_tokens;
 };
 
 void CodeGenHexagon::Init(const std::string& module_name, LLVMTarget* llvm_target, bool system_lib,
@@ -179,6 +184,122 @@ llvm::Value* CodeGenHexagon::CreateCallExtern(Type ret_type, String global_symbo
   if (IsQHLFunction(global_symbol) && (num_lanes > vector_length))
     return CreateCallExternQHL(ret_type, global_symbol, args, skip_first_arg);
   return CodeGenCPU::CreateCallExtern(ret_type, global_symbol, args, skip_first_arg);
+}
+
+// void CodeGenHexagon::VisitStmt_(const AttrStmtNode* op) {
+//   LOG(ERROR) << "VisitStmt_";
+//   if (op->attr_key == tir::attr::async_commit_queue_scope) {
+//     // save the current queue for use in subsequent async annotations
+//     const IntImmNode* queue = op->value.as<IntImmNode>();
+//     ICHECK(queue && queue->value >= 0) << "Async queue is negative or not constant";
+//     async_queue = op->value;
+//     this->VisitStmt(op->body);
+//   } else if (op->attr_key == tir::attr::async_signal_token) {
+//     PrimExpr token = op->value;
+//     // auto call_signal = tir::Call(DataType::Void(), builtin::call_extern(),
+//     //                         {tvm::tir::StringImm("device_api_hexagon_signal"), async_queue,
+//     //                         token});
+//     this->VisitStmt(op->body);
+//     // CodeGenLLVM::VisitExpr(call_signal);
+//     // GetType(GetRef<PrimExpr>(op)
+//     LOG(ERROR) << "VisitStmt: signal";
+//     CreateCallExtern(PrimType(DataType::Void()), String("device_api_hexagon_signal"),
+//                      {async_queue, token}, false);
+//     // this->VisitExpr(call_signal);  // perform the Signal() AFTER the body
+//   } else if (op->attr_key == tir::attr::async_wait_token) {
+//     PrimExpr token = op->value;
+//     // auto call_wait = tir::Call(DataType::Void(), builtin::call_extern(),
+//     //                       {tvm::tir::StringImm("device_api_hexagon_wait"), async_queue,
+//     token});
+//     // CodeGenLLVM::VisitExpr(call_wait);
+//     LOG(ERROR) << "VisitStmt: wait";
+//     CreateCallExtern(PrimType(DataType::Void()), String("device_api_hexagon_signal"),
+//                      {async_queue, token}, false);
+//     // this->VisitExpr(call_wait);  // perform the Wait() BEFORE the body
+//     this->VisitStmt(op->body);
+//   } else {
+//     return CodeGenCPU::VisitStmt_(op);
+//   }
+// }
+
+// void CodeGenHexagon::VisitStmt_(const AttrStmtNode* op) {
+//   if (op->attr_key == tir::attr::async_commit_queue_scope) {
+//     // save the current queue for use in subsequent async annotations
+//     const IntImmNode* queue = op->value.as<IntImmNode>();
+//     ICHECK(queue && queue->value >= 0) << "Async queue is negative or not constant";
+//     async_queue = op->value;
+//     this->VisitStmt(op->body);
+//   } else if (op->attr_key == tir::attr::async_signal_token) {
+//     PrimExpr token = op->value;
+//     auto call_signal =
+//         tir::Call(DataType::Void(), builtin::call_extern(),
+//                   {tvm::tir::StringImm("device_api_hexagon_signal"), async_queue, token});
+//     this->VisitStmt(op->body);
+//     this->VisitExpr(call_signal);  // perform the Signal() AFTER the body
+//   } else if (op->attr_key == tir::attr::async_wait_token) {
+//     PrimExpr token = op->value;
+//     auto call_wait =
+//         tir::Call(DataType::Void(), builtin::call_extern(),
+//                   {tvm::tir::StringImm("device_api_hexagon_wait"), async_queue, token});
+//     this->VisitExpr(call_wait);  // perform the Wait() BEFORE the body
+//     this->VisitStmt(op->body);
+//   } else {
+//     return CodeGenCPU::VisitStmt_(op);
+//   }
+// }
+
+void CodeGenHexagon::VisitStmt_(const AttrStmtNode* op) {
+  // LOG(ERROR) << "attr key: " << op->attr_key;
+  if (op->attr_key == tir::attr::async_commit_queue_scope) {
+    // save the current queue for use in subsequent async annotations
+    // LOG(ERROR) << "async_commit_queue handled";
+    const IntImmNode* queue = op->value.as<IntImmNode>();
+    ICHECK(queue && queue->value >= 0) << "Async queue is negative or not constant";
+    async_queue = op->value;
+  } else if (op->attr_key == tir::attr::async_signal_token) {
+    PrimExpr token = op->value;
+    signal_tokens.emplace_back(token);
+  } else if (op->attr_key == tir::attr::async_wait_token) {
+    PrimExpr token = op->value;
+    wait_tokens.emplace_back(token);
+  } 
+  // else if (op->attr_key == tir::attr::async_scope) {
+  // } 
+  else {
+    // LOG(ERROR) << "unhandled attr " << op->attr_key;
+    return CodeGenCPU::VisitStmt_(op);
+  }
+
+  // LOG(ERROR) << "checkpoint";
+  if (op->body.as<AttrStmtNode>()) {  // more attrs to process
+    // LOG(ERROR) << "Body is attr " << op->body.as<AttrStmtNode>()->attr_key;
+    this->VisitStmt(op->body);
+  } else {  // no more attr statements; handle async calls before/after body
+    LOG(ERROR) << "Body is NOT attr";
+    // emit Wait() calls before body
+    for (PrimExpr wait : wait_tokens) {
+      LOG(ERROR) << "wait: " << async_queue << ", " << wait;
+      auto call_wait =
+          tir::Call(DataType::Void(), builtin::call_extern(),
+                    {tvm::tir::StringImm("device_api_hexagon_wait"), async_queue, wait});
+      this->VisitExpr(call_wait);
+    }
+    wait_tokens.clear();
+    LOG(ERROR) << "waits emmitted";
+    // emit body
+    this->VisitStmt(op->body);
+    LOG(ERROR) << "body emmitted";
+    // emit Signal() calls after body
+    for (PrimExpr signal : signal_tokens) {
+      auto call_signal =
+          tir::Call(DataType::Void(), builtin::call_extern(),
+                    {tvm::tir::StringImm("device_api_hexagon_signal"), async_queue, signal});
+      this->VisitExpr(call_signal);
+    }
+    signal_tokens.clear();
+    LOG(ERROR) << "signals emitted";
+    async_queue = -1;
+  }
 }
 
 llvm::Value* CodeGenHexagon::VisitExpr_(const BufferLoadNode* op) {

@@ -323,6 +323,21 @@ TVM_REGISTER_GLOBAL("device_api.hexagon").set_body([](TVMArgs args, TVMRetValue*
   *rv = static_cast<void*>(ptr);
 });
 
+extern "C" void device_api_hexagon_signal(int queue, int token) {
+  HexagonDeviceAPI::Global()->ThreadManager()->Signal(reinterpret_cast<TVMStreamHandle>(queue),
+                                                      token);
+}
+
+extern "C" void device_api_hexagon_wait(int queue, int token) {
+  HexagonDeviceAPI::Global()->ThreadManager()->Wait(reinterpret_cast<TVMStreamHandle>(queue),
+                                                    token);
+}
+
+extern "C" void device_api_hexagon_dispatch(TVMStreamHandle thread, void* f, void* arg) {
+  HexagonDeviceAPI::Global()->ThreadManager()->Dispatch(thread,
+                                                        reinterpret_cast<void (*)(void*)>(f), arg);
+}
+
 }  // namespace hexagon
 }  // namespace runtime
 }  // namespace tvm

@@ -354,11 +354,11 @@ class PipelineRewriter : public StmtExprMutator {
     }
 
     // Step 2: Emit the pipeline prologue, body and epilogue.
-    Stmt prologue = EmitImpl(pipeline_loop_->min, pipeline_loop_->min + max_stage_, true);
+    Stmt prologue = EmitImpl(pipeline_loop_->min, pipeline_loop_->min + max_stage_, true, false);
     Stmt body = EmitImpl(pipeline_loop_->min + max_stage_,
-                         pipeline_loop_->min + pipeline_loop_->extent, false);
+                         pipeline_loop_->min + pipeline_loop_->extent, false, false);
     Stmt epilogue = EmitImpl(pipeline_loop_->min + pipeline_loop_->extent,
-                             pipeline_loop_->min + pipeline_loop_->extent + max_stage_, true);
+                             pipeline_loop_->min + pipeline_loop_->extent + max_stage_, true, true);
 
     SeqStmt stmt = SeqStmt({prologue, body, epilogue});
 
@@ -546,11 +546,13 @@ class PipelineRewriter : public StmtExprMutator {
       // in_flight_count would be a more precise name, but the implementation uses wait_count for
       // brevity.
       PrimExpr wait_count{nullptr};
+      // keep track of the lowest allowable token for the target queue (used in predicate)
+      PrimExpr min_token{nullptr};
 
       bool valid() const { return wait_count.defined(); }
 
-      wait_info(int insert_before, PrimExpr wait_count)
-          : insert_before(insert_before), wait_count(wait_count) {}
+      wait_info(int insert_before, PrimExpr wait_count, PrimExpr min_token)
+          : insert_before(insert_before), wait_count(wait_count), min_token(min_token) {}
     };
     std::list<wait_info> pending_waits;
 
@@ -636,57 +638,22 @@ class PipelineRewriter : public StmtExprMutator {
       // If this block has no async producers and no async consumers, nothing to do.
       if (!any_async_producer && !any_async_consumer) continue;
 
-      // For each stage on which this block depends, collect all producer heads and compute
-      // necessary guards
+      // For each stage on which this block depends, insert a wait for each commit group dependency
       for (auto producer : producers) {
         int producer_stage_idx = producer.first;
         if (!async_states[producer_stage_idx].is_async)
           continue;  // Nothing to do if the producer is synchronous
         auto& producer_local_state = (*async_states_local)[producer_stage_idx];
-        const auto num_commit_group = producer_local_state.commit_groups.size();
-        std::vector<Optional<PrimExpr>> producer_head_per_commit;
-
-        if (num_commit_group == 0) {
-          // Epilogue, no async producer. Since "local" producer_head is not available, use
-          // "global" producer_head.
-          ICHECK(!producer_local_state.producer_head);
-          producer_head_per_commit.push_back(async_states[producer_stage_idx].producer_head);
-        } else {
-          ICHECK(producer_local_state.producer_head);
-          std::vector<bool> need_wait_count(num_commit_group, true);
-          for (auto read_region : producer.second) {
-            auto commit_group_id = buffer_to_commit_group.at(read_region->buffer.get());
-            if (!need_wait_count[commit_group_id]) continue;
-
-            if (producer_local_state.seen.count(read_region->buffer.get()) > 0) {
-              // Normal case: the write has already been issued before this program point
-              producer_head_per_commit.push_back(producer_local_state.producer_head.value());
-            } else {
-              // Interleaved case: the most recent async write is from the previous iteration
-              producer_head_per_commit.push_back(producer_local_state.producer_head.value() - 1);
-            }
-            need_wait_count[commit_group_id] = false;
-          }
+        std::set<int>
+            already_seen;  // only need to wait on a given commit group once; ignore additional
+        for (auto read_region : producer.second) {
+          auto commit_group_id = buffer_to_commit_group_global.at(read_region->buffer.get());
+          if (already_seen.count(commit_group_id) > 0) continue;
+          PrimExpr base = base_tokens[producer_stage_idx][commit_group_id];
+          PrimExpr token = base + new_blocks[i].access_index;
+          producer_local_state.pending_waits.emplace_back(static_cast<int>(i), token, base);
+          already_seen.emplace(commit_group_id);
         }
-
-        // Compute the wait count based on producer head(s)
-        auto wait_count = [=, &ana_normalized]() {
-          auto sum = PrimExpr(0);
-          for (auto producer_head : producer_head_per_commit) {
-            if (producer_head && ana_normalized->CanProve(producer_head.value() >= 0)) {
-              // Here, new_blocks[i].access_index corresponds to "consumer_head".
-              // The difference of producer_head and consumer_head is precisely the number of
-              // async commit groups that can still be in flight after this wait.
-              sum += analyzer_.Simplify(producer_head.value() - new_blocks[i].access_index);
-            } else {
-              // The precise count cannot be determined, give up.
-              return PrimExpr(0);
-            }
-          }
-          return sum;
-        }();
-
-        producer_local_state.pending_waits.emplace_back(static_cast<int>(i), wait_count);
       }
 
       // For each stage that depends on this block, if there is an async relationship, insert buffer
@@ -696,26 +663,152 @@ class PipelineRewriter : public StmtExprMutator {
         auto& consumer_local_state = (*async_states_local)[consumer_stage_idx];
         auto& consumer_global_state = (async_states)[consumer_stage_idx];
         if (consumer_global_state.is_async) {
-          PrimExpr wait_count;  // if there are multiple buffers, find the strictest wait count
           for (BufferRegion consumer_region : consumer.second) {
+            auto commit_group_id = buffer_to_commit_group_global.at(consumer_region->buffer.get());
             auto num_slices = consumer_region.get()->buffer->shape[0];  // buffer duplication factor
             auto stage_offset =
                 new_blocks[i].access_index - consumer_local_state.producer_head.value();
-            // num_slices is max number of ops (read and write) that can be in-flight for the
-            // buffer. stage_offset + 1 is the number of writes that have been dispatched (including
-            // this iteration). Difference is the "free" slices that the reader can be working on.
-            auto count = analyzer_.Simplify(num_slices - stage_offset - 1);
-            if (!wait_count.defined() || !analyzer_.CanProve(wait_count <= count)) {
-              wait_count = count;  // Keep the most conservative (lowest) wait count
-            }
+            auto overwrite_offset =
+                num_slices -
+                stage_offset;  // how far ahead this stage can get before it starts overwriting
+            PrimExpr base = base_tokens[consumer_stage_idx][commit_group_id];
+            PrimExpr token = base + new_blocks[i].access_index - overwrite_offset -
+                             1;  // token that must be waited on
+            consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), token, base);
           }
-          if (!analyzer_.CanProve(wait_count >= 0)) {
-            // if we don't know the wait count statically, default to most conservative (zero)
-            wait_count = PrimExpr(0);
-          }
-          consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), wait_count);
         }
       }
+
+      // // For each stage on which this block depends, collect all producer heads and compute
+      // // necessary guards
+      // for (auto producer : producers) {
+      //   int producer_stage_idx = producer.first;
+      //   if (!async_states[producer_stage_idx].is_async)
+      //     continue;  // Nothing to do if the producer is synchronous
+      //   auto& producer_local_state = (*async_states_local)[producer_stage_idx];
+      //   const auto num_commit_group = producer_local_state.commit_groups.size();
+      //   std::vector<Optional<PrimExpr>> producer_head_per_commit;
+
+      //   if (num_commit_group == 0) {
+      //     // Epilogue, no async producer. Since "local" producer_head is not available, use
+      //     // "global" producer_head.
+      //     ICHECK(!producer_local_state.producer_head);
+      //     // TODO: does the logic creating commit groups assume DMA? why did the original have no
+      //     commit groups in the epilogue?
+      //     // producer_head_per_commit.push_back(async_states[producer_stage_idx].producer_head);
+
+      //   }
+      //   else {
+      //     ICHECK(producer_local_state.producer_head);
+      //     std::vector<bool> need_wait_count(num_commit_group, true);
+      //     for (auto read_region : producer.second) {
+      //       auto commit_group_id = buffer_to_commit_group.at(read_region->buffer.get());
+      //       if (!need_wait_count[commit_group_id]) continue;  // multiple buffers committed
+      //       together: only wait once
+
+      //       auto token = new_blocks[i].access_index * 1000 +
+      //       producer_local_state.producer_head.value() * 100 + commit_group_id; if
+      //       (producer_local_state.seen.count(read_region->buffer.get()) > 0) {
+      //         // Normal case: the write has already been issued before this program point
+      //         // producer_head_per_commit.push_back(producer_local_state.producer_head.value());
+      //         producer_head_per_commit.push_back(token);
+      //       } else {
+      //         // Interleaved case: the most recent async write is from the previous iteration
+      //         producer_head_per_commit.push_back(token - 1);
+      //       }
+      //       need_wait_count[commit_group_id] = false;
+      //     }
+      //   }
+
+      //   // Compute the wait count based on producer head(s)
+      //   auto wait_count = [=, &ana_normalized]() {
+      //     auto latest_token = PrimExpr(0);
+      //     for (auto producer_head : producer_head_per_commit) {
+      //       // only need to wait on the latest (highest value) token from a given queue
+      //       // TODO: this reasoning may wrong; each entry in producer_head_per_commit is from a
+      //       different commit group,
+      //       //  but we don't know which stage (hardware queue) it's from. Can only combine tokens
+      //       (via max) if they belong
+      //       //  to the same queue
+      //       // ==> NEVERMIND it's fine; this is inside a loop over "producers", which separate
+      //       read_regions by stage
+      //       //   all wait counts here are from the same stage (but different commit groups)
+      //       auto val = producer_head.value();
+      //       if (ana_normalized->CanProve(latest_token < val)) {
+      //         latest_token = val;
+      //       }
+      //       else {
+      //         latest_token = max(latest_token, val);
+      //       }
+      //       // if (producer_head && ana_normalized->CanProve(producer_head.value() >= 0)) {
+      //       //   // Here, new_blocks[i].access_index corresponds to "consumer_head".
+      //       //   // The difference of producer_head and consumer_head is precisely the number of
+      //       //   // async commit groups that can still be in flight after this wait.
+      //       //   // sum += analyzer_.Simplify(producer_head.value() -
+      //       new_blocks[i].access_index);
+      //       //   sum += analyzer_.Simplify(producer_head.value());
+      //       // } else {
+      //       //   // The precise count cannot be determined, give up.
+      //       //   return PrimExpr(0);
+      //       // }
+      //     }
+      //     return latest_token;
+      //   }();
+
+      //   producer_local_state.pending_waits.emplace_back(static_cast<int>(i), wait_count);
+      // }
+
+      // // For each stage that depends on this block, if there is an async relationship, insert
+      // buffer
+      // // overwrite guard. We only need the strictest guard.
+      // for (auto consumer : consumers) {
+      //   int consumer_stage_idx = consumer.first;
+      //   auto& consumer_local_state = (*async_states_local)[consumer_stage_idx];
+      //   auto& consumer_global_state = (async_states)[consumer_stage_idx];
+      //   if (consumer_global_state.is_async) {
+      //     // PrimExpr wait_count;  // if there are multiple buffers, find the strictest wait
+      //     count
+      //     // for (BufferRegion consumer_region : consumer.second) {
+      //     //   auto num_slices = consumer_region.get()->buffer->shape[0];  // buffer duplication
+      //     factor
+      //     //   auto stage_offset =
+      //     //       new_blocks[i].access_index - consumer_local_state.producer_head.value();
+      //     //   // num_slices is max number of ops (read and write) that can be in-flight for the
+      //     //   // buffer. stage_offset + 1 is the number of writes that have been dispatched
+      //     (including
+      //     //   // this iteration). Difference is the "free" slices that the reader can be working
+      //     on.
+      //     //   auto count = analyzer_.Simplify(num_slices - stage_offset - 1);
+      //     //   if (!wait_count.defined() || !analyzer_.CanProve(wait_count <= count)) {
+      //     //     wait_count = count;  // Keep the most conservative (lowest) wait count
+      //     //   }
+      //     // }
+      //     // if (!analyzer_.CanProve(wait_count >= 0)) {
+      //     //   // if we don't know the wait count statically, default to most conservative (zero)
+      //     //   wait_count = PrimExpr(0);  // TODO: this is PTX style assumption, doesn't work now
+      //     //   // TODO: if we don't know the wait count statically, just use the dynamic wait
+      //     count
+      //     //   //  (PTX required static wait counts, but the transform doesn't need to require
+      //     it)
+      //     // }
+      //     // consumer_local_state.pending_waits.emplace_back(static_cast<int>(i), wait_count);
+      //     PrimExpr wait_count = PrimExpr(0);
+      //     for (BufferRegion consumer_region : consumer.second) {
+      //       auto commit_group_id = buffer_to_commit_group.at(consumer_region->buffer.get());
+      //       // auto num_slices = consumer_region.get()->buffer->shape[0];  // buffer duplication
+      //       factor
+      //       // auto stage_offset = new_blocks[i].access_index -
+      //       consumer_local_state.producer_head.value();
+      //       // auto count = analyzer_.Simplify(num_slices - stage_offset - 1);
+      //       auto token = new_blocks[i].access_index * 1000 +
+      //       consumer_local_state.producer_head.value() * 100 + commit_group_id; if
+      //       (ana_normalized->CanProve(wait_count < token)) {
+      //         wait_count = token;  // keep the latest token (implicitly depends on previous
+      //         tokens of the same queue)
+      //       }
+      //     }
+      //   }
+      // }
     }
   }
 
@@ -727,32 +820,44 @@ class PipelineRewriter : public StmtExprMutator {
       arith::Analyzer* ana_normalized) const {
     std::vector<RewrittenBlockInfo> new_blocks = blocks;
     std::vector<int> commit_group_indices(new_blocks.size(), -1);
+    std::vector<int> block_to_commit_group(new_blocks.size(), -1);
+    std::vector<PrimExpr> block_to_producer_head(new_blocks.size(), -1);
 
     // lambda to insert annotations for each async_wait
     auto attach_wait_scope = [&new_blocks, ana_normalized](int block_index, int stage_id,
-                                                           PrimExpr wait_count,
+                                                           PrimExpr token,
                                                            Optional<PrimExpr> predicate) {
       auto& block = new_blocks[block_index].block;
       BlockNode* n = block.CopyOnWrite();
       auto zero = make_zero(DataType::Int(32));
-      if (!predicate || (predicate && ana_normalized->CanProve(predicate.value())) || (ana_normalized->CanProve(wait_count == 0))) {
-        n->body =
-            AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
-                     AttrStmt(zero, tir::attr::async_wait_inflight_count, wait_count, n->body));
+      PrimExpr token_simple = ana_normalized->Simplify(token);
+      // if (!predicate || (predicate && ana_normalized->CanProve(predicate.value())) ||
+      // (ana_normalized->CanProve(wait_count == 0))) {
+
+      if (!predicate || (predicate && ana_normalized->CanProve(predicate.value()))) {
+        // n->body =
+        //     AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
+        //              AttrStmt(zero, tir::attr::async_wait_inflight_count, token_simple,
+        //              n->body));
+        n->body = AttrStmt(zero, tir::attr::async_wait_token, token_simple, n->body);
       } else {
         Array<Stmt> stmts;
         // auto ifstmt = IfThenElse(predicate.value(),
         //                          AttrStmt(zero, tir::attr::async_wait_queue_scope, stage_id,
         //                                   AttrStmt(zero, tir::attr::async_wait_inflight_count,
-        //                                            wait_count, tir::Evaluate(zero))));
-        // stmts.push_back(ifstmt);
-        // stmts.push_back(n->body);
-        // n->body = SeqStmt(stmts);
-        auto predicated_count =
-            Call(DataType::Int(32), builtin::if_then_else(), {predicate.value(), wait_count, zero});
-        n->body = AttrStmt(
-            zero, tir::attr::async_wait_queue_scope, stage_id,
-            AttrStmt(zero, tir::attr::async_wait_inflight_count, predicated_count, n->body));
+        //                                            token_simple, tir::Evaluate(zero))));
+        auto ifstmt = IfThenElse(
+            predicate.value(),
+            AttrStmt(zero, tir::attr::async_wait_token, token_simple, tir::Evaluate(zero)));
+        stmts.push_back(ifstmt);
+        stmts.push_back(n->body);
+        n->body = SeqStmt(stmts);
+        // auto predicated_count =
+        //     Call(DataType::Int(32), builtin::if_then_else(), {predicate.value(), wait_count,
+        //     zero});
+        // n->body = AttrStmt(
+        //     zero, tir::attr::async_wait_queue_scope, stage_id,
+        //     AttrStmt(zero, tir::attr::async_wait_inflight_count, predicated_count, n->body));
       }
     };
 
@@ -764,13 +869,25 @@ class PipelineRewriter : public StmtExprMutator {
           for (size_t j = 0; j < state.commit_groups[i].size(); ++j) {
             ICHECK(state.commit_groups[i][0] + j < new_blocks.size());
             commit_group_indices[state.commit_groups[i][0] + j] = stage_id;
+            block_to_commit_group[state.commit_groups[i][j]] = i;
+            // ICHECK(state.producer_head != nullptr);
+            block_to_producer_head[state.commit_groups[i][j]] = state.producer_head.value();
           }
         }
       }
 
       for (auto pending_wait : state.pending_waits) {
-        attach_wait_scope(pending_wait.insert_before, stage_id, pending_wait.wait_count,
-                          state.predicate);
+        Optional<PrimExpr> predicate = state.predicate;
+        PrimExpr token = pending_wait.wait_count;
+        if (!ana_normalized->CanProve(token >= pending_wait.min_token)) {
+          if (predicate.defined()) {
+            predicate = ana_normalized->Simplify(predicate.value() && (token >= pending_wait.min_token));
+          }
+          else {
+            predicate = ana_normalized->Simplify(token >= pending_wait.min_token);
+          }
+        }
+        attach_wait_scope(pending_wait.insert_before, stage_id, token, predicate);
       }
     }
 
@@ -786,6 +903,8 @@ class PipelineRewriter : public StmtExprMutator {
         Array<Stmt> group_bodies;
         auto stage_id = commit_group_indices[i];
         auto predicate = new_blocks[i].predicate;
+        int block_index =
+            i;  // if blocks are merged, they must have same producer head and commit group
         for (; i < commit_group_indices.size() && commit_group_indices[i] == stage_id; ++i) {
           ICHECK(tvm::StructuralEqual()(predicate, new_blocks[i].predicate))
               << "Predicates in the same stage are expected to be identical";
@@ -799,8 +918,14 @@ class PipelineRewriter : public StmtExprMutator {
         }
 
         for (auto body : group_bodies) {
+          auto token = base_tokens[stage_id][block_to_commit_group[block_index]] +
+                       block_to_producer_head[block_index];
+          token = ana_normalized->Simplify(token);
+          // auto commit_queue_scope = AttrStmt(make_zero(DataType::Int(32)),
+          //                                    tir::attr::async_commit_queue_scope, stage_id,
+          //                                    body);
           auto commit_queue_scope = AttrStmt(make_zero(DataType::Int(32)),
-                                             tir::attr::async_commit_queue_scope, stage_id, body);
+                                             tir::attr::async_signal_token, token, body);
           auto new_block = MakeBlock(commit_queue_scope, buffer_data_to_buffer_);
           stmts.push_back(BlockRealize({}, predicate, new_block));
         }
@@ -815,9 +940,12 @@ class PipelineRewriter : public StmtExprMutator {
    * \param start The start of the range
    * \param end The end of the range
    * \param unroll_loop Whether the loop should be unrolled.
+   * \param is_epilogue Whether this is the epilogue of a pipeline.
    * \return The result loop.
    */
-  Stmt EmitImpl(PrimExpr start, PrimExpr end, bool unroll_loop) {
+  Stmt EmitImpl(PrimExpr start, PrimExpr end, bool unroll_loop, bool is_epilogue) {
+    //  in the epilogue ONLY you still do predicated waits regardless of predicate
+    //  all other cases, use an if-stmt to do no wait on false branch
     PrimExpr new_loop_var;
     PrimExpr extent = end - start;
 
@@ -902,6 +1030,7 @@ class PipelineRewriter : public StmtExprMutator {
       for (auto write_region : new_block->writes) {
         async_states[stage].dst_buffers.insert(write_region->buffer.get());
         buffer_to_commit_group[write_region->buffer.get()] = commit_group_id;
+        buffer_to_commit_group_global[write_region->buffer.get()] = commit_group_id;
       }
 
       for (auto read_region : new_block->reads) {
@@ -910,10 +1039,28 @@ class PipelineRewriter : public StmtExprMutator {
 
       local_state.producer_head = normalized_access_index;
 
+      // When a block is predicated, we want calls to async "wait()" depending on the block to also
+      // be predicated. However, pipeline epilogue predicates should not result in a predicated wait
+      // in order to respect
+      //  data dependencies (the block will no longer be in bounds, but the data must still be
+      //  waited on).
       if (!local_state.predicate || ana_normalized.CanProve(local_state.predicate.value())) {
-        local_state.predicate = inbound;
+        // There is no predicate, or there is but we can statically prove the predicate true
+        if (!is_epilogue) {
+          // if not in the epilogue, we want "wait" calls depending on this block to be predicated
+          local_state.predicate = inbound;
+        } else {
+          // if in the epilogue, do not make dependent waits predicated
+          local_state.predicate = nullptr;
+        }
       } else if (local_state.predicate) {
-        local_state.predicate = ana_normalized.Simplify(local_state.predicate.value() & inbound);
+        // There is a predicate, and we couldn't statically prove it true
+        if (!is_epilogue) {
+          // if not in the epilogue, we want "wait" calls depending on this block to be predicated
+          local_state.predicate = ana_normalized.Simplify(local_state.predicate.value() && inbound);
+        }
+        // if in the epilogue, we leave the current predicate in place without adding the "inbound"
+        // condition
       }
 
       if (pipeline_info_[block].async) {
@@ -933,6 +1080,44 @@ class PipelineRewriter : public StmtExprMutator {
         }
       }
     }
+
+    PrimExpr n_steps = pipeline_loop_->extent;  // local "extent" is just for this section; we want
+                                                // original pipeline loop extent
+    PrimExpr next_token = 1;  // start number from 1 so null tokenIDs are indicative of error
+    // If we've already started allocating tokens, find the next token ID
+    for (auto group_tokens : base_tokens) {
+      next_token = next_token + static_cast<int>(group_tokens.size()) * n_steps;
+      next_token = analyzer_.Simplify(next_token);
+    }
+
+    for (auto it_state : async_states_local) {
+      int stage = it_state.first;
+      AsyncStateLocal& state = it_state.second;
+      if (!async_states[stage].is_async) {
+        continue;  // only async stages have tokens allocated
+      }
+
+      int num_commit_groups = state.commit_groups.size();
+      if (num_commit_groups == 0) {
+        continue;  // no commit groups for a stage if it doesn't show up in prologue/epilogue
+      }
+
+      if (base_tokens.size() <= stage) {
+        // Tokens for this stage not yet allocated
+        base_tokens.emplace_back(std::vector<PrimExpr>(num_commit_groups));
+        for (int i = 0; i < num_commit_groups; i++) {
+          base_tokens[stage][i] = next_token;
+          next_token = next_token + n_steps;
+        }
+      }
+    }
+
+    // TODO -- DONE
+    // iterate through async_states_local and create the stageID,groupID->base_token mappings (IF
+    // they do not already exist) This will duplicate work across prologue/body/epilogue, so the
+    // check that it doesn't already exist is important] defined above: PrimExpr extent <-- wrong
+    // extent, as its local to EmitImpl instead, use pipeline_loop_->extent, which is the whole
+    // pipeline loops extent (not just this section)
 
     PopulateWaitCounts(new_blocks, &ana_normalized, buffer_to_commit_group, &async_states_local);
     auto stmts = CompletePipelineLoopStatements(new_blocks, async_states_local, &ana_normalized);
@@ -987,6 +1172,9 @@ class PipelineRewriter : public StmtExprMutator {
   std::map<int, AsyncStateGlobal> async_states;
   Map<String, ObjectRef> preserved_annotations_;
   bool merge_async_commit_queue_scope_ = true;
+  std::unordered_map<const BufferNode*, int> buffer_to_commit_group_global;
+  std::vector<std::vector<PrimExpr>>
+      base_tokens;  // base_tokens[stage_id][commit_group] = base token
 };
 
 /*!
