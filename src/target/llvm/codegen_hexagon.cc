@@ -204,30 +204,41 @@ void CodeGenHexagon::VisitStmt_(const AttrStmtNode* op) {
   else {  // Not an async annotation -- let cpu codegen handle
     return CodeGenCPU::VisitStmt_(op);
   }
-  
-  if (op->body.as<AttrStmtNode>()) {  // more attrs to process
-    return this->VisitStmt(op->body);
-  } else {  // no more attr statements; handle async calls
-    for (PrimExpr wait : wait_tokens) {
-      // emit Wait() calls before body
-      auto call_wait =
-          tir::Call(DataType::Void(), builtin::call_extern(),
-                    {tvm::tir::StringImm("device_api_hexagon_wait"), async_queue, wait});
-      this->VisitExpr(call_wait);
+
+  // If there are any additinoal attr nodes for async ops, recurse
+  // else, emit calls
+  auto next_op = op->body;
+  while (next_op.as<AttrStmtNode>()) {
+    auto next_attr = next_op.as<AttrStmtNode>()->attr_key;
+    if (next_attr == tir::attr::async_commit_queue_scope ||
+	next_attr == tir::attr::async_signal_token ||
+	next_attr == tir::attr::async_wait_token) {
+      return this->VisitStmt(op->body);
+    } else {
+      next_op = next_op.as<AttrStmtNode>()->body;
     }
-    wait_tokens.clear();
-    // emit body
-    this->VisitStmt(op->body);
-    // emit Signal() calls after body
-    for (PrimExpr signal : signal_tokens) {
-      auto call_signal =
-          tir::Call(DataType::Void(), builtin::call_extern(),
-                    {tvm::tir::StringImm("device_api_hexagon_signal"), async_queue, signal});
-      this->VisitExpr(call_signal);
-    }
-    signal_tokens.clear();
-    async_queue = -1;  // reset the queue ID
   }
+
+  // At this point, there are no additional async annotations; handle emitting all calls
+  for (PrimExpr wait : wait_tokens) {
+    // emit Wait() calls before body
+    auto call_wait =
+      tir::Call(DataType::Void(), builtin::call_extern(),
+		{tvm::tir::StringImm("device_api_hexagon_wait"), async_queue, wait});
+    this->VisitExpr(call_wait);
+  }
+  wait_tokens.clear();
+  // emit body
+  this->VisitStmt(op->body);
+  // emit Signal() calls after body
+  for (PrimExpr signal : signal_tokens) {
+    auto call_signal =
+      tir::Call(DataType::Void(), builtin::call_extern(),
+		{tvm::tir::StringImm("device_api_hexagon_signal"), async_queue, signal});
+    this->VisitExpr(call_signal);
+  }
+  signal_tokens.clear();
+  async_queue = -1;  // reset the queue ID
 }
 
 llvm::Value* CodeGenHexagon::VisitExpr_(const BufferLoadNode* op) {
