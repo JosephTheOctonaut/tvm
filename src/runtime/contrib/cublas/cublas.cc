@@ -371,6 +371,8 @@ inline void CallLtFP8Gemm(TVMArgs args, TVMRetValue* ret, cublasLtHandle_t hdl, 
   int ldb = transa ? N : K;
   int ldd = M;
 
+  
+  
   auto A_data = static_cast<void*>(static_cast<char*>(A->data) + A->byte_offset);
   auto B_data = static_cast<void*>(static_cast<char*>(B->data) + B->byte_offset);
   auto D_data = static_cast<void*>(static_cast<char*>(D->data) + D->byte_offset);
@@ -395,11 +397,11 @@ inline void CallLtFP8Gemm(TVMArgs args, TVMRetValue* ret, cublasLtHandle_t hdl, 
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
                                                     &op_transa, sizeof(op_transa)));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-						    A_scale_data, sizeof(float)));
+						    &A_scale_data, sizeof(float*)));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-						    B_scale_data, sizeof(float)));
+						    &B_scale_data, sizeof(float*)));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER,
-						    D_scale_data, sizeof(float)));
+						    &D_scale_data, sizeof(float*)));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM,
 						    &fast_accum, sizeof(fast_accum)));
 						    
