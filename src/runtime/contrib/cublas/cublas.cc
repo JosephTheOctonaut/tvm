@@ -653,7 +653,7 @@ TVM_REGISTER_GLOBAL("tvm.contrib.cublas.matmul").set_body([](TVMArgs args, TVMRe
 #if CUDART_VERSION >= 10010
 TVM_REGISTER_GLOBAL("tvm.contrib.cublaslt.matmul").set_body([](TVMArgs args, TVMRetValue* ret) {
   DLTensor* A = args[0];
-  DLTensor* B = args[0];
+  DLTensor* B = args[1];
 
   CuBlasThreadEntry* entry_ptr = CuBlasThreadEntry::ThreadLocal();
 
