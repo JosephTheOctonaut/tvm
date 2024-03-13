@@ -19,8 +19,11 @@ import tvm
 from tvm import te
 
 
-def matmul(lhs, rhs, transa=False, transb=False, n=0, m=0, dtype=None):
-    """Create an extern op that compute matrix mult of A and rhs with cuBLAS
+def matmul(lhs, rhs, transa=False, transb=False, n=0, m=0, dtype=None, A_scale=None, B_scale=None, D_scale=None):
+    """Create an extern op that compute matrix mult of lhs and rhs with cuBLASLt.
+    Quantized scale factors are only used for FP8 calls, and should be None for int8 calls.
+    Quantized scale factors must be scalar (size-1) Tensors of float32 values.
+    Batched matmul is supported in clubasLt, but not currently implemented in the integration.
 
     Parameters
     ----------
@@ -32,6 +35,12 @@ def matmul(lhs, rhs, transa=False, transb=False, n=0, m=0, dtype=None):
         Whether transpose lhs
     transb : bool
         Whether transpose rhs
+    A_scale: Tensor(float32)
+        Scale value for tensor A
+    B_scale: Tensor(float32)
+        Scale value for tensor B
+    D_scale: Tensor(float32)
+        Scale value for tensor D
 
     Returns
     -------
@@ -47,7 +56,7 @@ def matmul(lhs, rhs, transa=False, transb=False, n=0, m=0, dtype=None):
         (n, m),
         [lhs, rhs],
         lambda ins, outs: tvm.tir.call_packed(
-            "tvm.contrib.cublaslt.matmul", ins[0], ins[1], outs[0], transa, transb
+            "tvm.contrib.cublaslt.matmul", ins[0], ins[1], outs[0], transa, transb, A_scale, B_scale, D_scale
         ),
         dtype=dtype,
         name="C",
