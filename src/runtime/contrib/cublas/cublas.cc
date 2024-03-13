@@ -322,7 +322,6 @@ void CallCublasLt(cublasLtHandle_t hdl, cudaStream_t stream,
 inline void CallLtFP8Gemm(TVMArgs args, TVMRetValue* ret, cublasLtHandle_t hdl, cudaStream_t stream) {
   // This function uses the cublsLt notion wherever possible. A and B are operands. C is bias. D is output.
   
-  // TODO: add bool flag for fast accum mode; default is false (slow/accurate accumulation)
   // TODO: make sure TVM alignment is at least 16 bytes (tensor pointers must be 16B aligned)
   // TODO: currently defaulting to column order layout; double check that's right
   
@@ -334,6 +333,7 @@ inline void CallLtFP8Gemm(TVMArgs args, TVMRetValue* ret, cublasLtHandle_t hdl, 
   DLTensor* A_scale = args[5];
   DLTensor* B_scale = args[6];
   DLTensor* D_scale = args[7];
+  bool fast_accum = args[8];
 
   ICHECK( !(IsInPlaceTranposed(A) || IsInPlaceTransposed(B)) ) << "in place transpose currently unsupported for fp8";
   ICHCECK(transa && !transb) << "FP8 cublas calls require A to be tranposed and B not transposed ('TN' format)";
@@ -397,11 +397,13 @@ inline void CallLtFP8Gemm(TVMArgs args, TVMRetValue* ret, cublasLtHandle_t hdl, 
 						    B_scale_data, sizeof(float)));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_D_SCALE_POINTER,
 						    D_scale_data, sizeof(float)));
+  CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM,
+						    fast_accum, sizeof(fast_accum)));
+						    
 
 
   // TODO: other calls have different order, doing " alpha, B_data, A_Desc, A_data, B_desc "
   // TODO: passing in null for C and C_desc. Since beta=0, could use D for in-place update with no bias (other calls do this)
-  // TODO: should instantiate heuristic? one call does that
   CHECK_CUBLAS_ERROR(cublasLtMatmul(hdl, op_desc, alpha, A_data, A_desc, B, B_desc, beta, nullptr, nullptr, D_data, D_desc,
 				    nullptr, nullptr, 0, stream));
   
@@ -646,7 +648,7 @@ TVM_REGISTER_GLOBAL("tvm.contrib.cublas.matmul").set_body([](TVMArgs args, TVMRe
 });
 
 #if CUDART_VERSION >= 10010
-TVM_REGISTER_GLOBAL("tvm.contrib.cublaslt.matmulfp8").set_body([](TVMArgs args, TVMRetValue* ret) {
+TVM_REGISTER_GLOBAL("tvm.contrib.cublaslt.matmul").set_body([](TVMArgs args, TVMRetValue* ret) {
   DLTensor* A = args[0];
   DLTensor* B = args[0];
 
