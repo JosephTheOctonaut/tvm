@@ -56,9 +56,9 @@ def matmul(lhs, rhs, transa=False, transb=False, n=0, m=0, dtype=None, A_scale=N
     dtype = dtype if dtype is not None else lhs.dtype
     return te.extern(
         (n, m),
-        [lhs, rhs],
+        [lhs, rhs, A_scale, B_scale, D_scale],
         lambda ins, outs: tvm.tir.call_packed(
-            "tvm.contrib.cublaslt.matmul", ins[0], ins[1], outs[0], transa, transb, A_scale, B_scale, D_scale, fast_accum
+            "tvm.contrib.cublaslt.matmul", ins[0], ins[1], outs[0], transa, transb, ins[2], ins[3], ins[4], fast_accum
         ),
         dtype=dtype,
         name="C",
