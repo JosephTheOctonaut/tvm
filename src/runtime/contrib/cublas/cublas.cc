@@ -32,8 +32,6 @@ namespace tvm {
 namespace contrib {
 
 using namespace runtime;
-#define kE4M3Float_code DataType::TypeCode::kE4M3Float
-#define kE5M2Float_code DataType::TypeCode::kE5M2Float
   
 inline cublasOperation_t CUBLASBooleanToTranspose(bool item) {
   return item ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -136,22 +134,27 @@ bool CheckMixPrecisionType(DLDataType in_dtype, DLDataType out_dtype, bool int_s
 
 // Check for supported cublasLt fp8 combinations
 bool CheckFP8FormatTypes(DLDataType A_dtype, DLDataType B_dtype, DLDataType D_dtype) {
-  // Ignoring BF16 and F32 for simplicity, but those are also supported in some combinations
-  if (TypeMatch(A_dtype, kE4M3Float_code, 8)) {
-    if (TypeMatch(B_dtype, kE4M3Float_code, 8)) {
+  // Ignoring BF16 and FP32 for simplicity, but those are also supported in some combinations
+  if (TypeMatch(A_dtype, DataType::TypeCode::kE4M3Float, 8)) {
+    if (TypeMatch(B_dtype, DataType::TypeCode::kE4M3Float, 8)) {
       // If both operands are e4m3, output must be e4m3 or fp16
-      return TypeMatch(D_dtype, kE4M3Float_code, 8) || TypeMatch(D_dtype, kDLFloat, 16);
+      return TypeMatch(D_dtype, DataType::TypeCode::kE4M3Float, 8) ||
+	     TypeMatch(D_dtype, kDLFloat, 16);
     }
-    else if (TypeMatch(B_dtype, kE5M2Float_code, 8)) {
+    else if (TypeMatch(B_dtype, DataType::TypeCode::kE5M2Float, 8)) {
       // If A is e4m3 and B is e5m2, output can be e4m3, e5m2, or fp16
-      return TypeMatch(D_dtype, kE4M3Float_code, 8) || TypeMatch(D_dtype, kE5M2Float_code, 8) || TypeMatch(D_dtype, kDLFloat, 16);
+      return TypeMatch(D_dtype, DataType::TypeCode::kE4M3Float, 8) ||
+	     TypeMatch(D_dtype, DataType::TypeCode::kE5M2Float, 8) ||
+	     TypeMatch(D_dtype, kDLFloat, 16);
     }
     else return false;
   }
-  else if (TypeMatch(A_dtype, kE5M2Float_code, 8)) {
-    if (TypeMatch(B_dtype, kE4M3Float_code, 8)) {
+  else if (TypeMatch(A_dtype, DataType::TypeCode::kE5M2Float, 8)) {
+    if (TypeMatch(B_dtype, DataType::TypeCode::kE4M3Float, 8)) {
       // if A is e5m2, B must be e4m3, and output can be e4m3, e5m2, or fp16
-      return TypeMatch(D_dtype, kE4M3Float_code, 8) || TypeMatch(D_dtype, kE5M2Float_code, 8) || TypeMatch(D_dtype, kDLFloat, 16);
+      return TypeMatch(D_dtype, DataType::TypeCode::kE4M3Float, 8) ||
+	     TypeMatch(D_dtype, DataType::TypeCode::kE5M2Float, 8) ||
+	     TypeMatch(D_dtype, kDLFloat, 16);
     }
     else return false;
   }
@@ -162,7 +165,7 @@ int roundoff(int v, int d) { return (v + d - 1) / d * d; }
 
 bool CheckIsFP8(DLDataType t) {
   // Check if the dtype is either nvidia fp8 type
-  return TypeMatch(t, kE4M3Float_code, 8) || TypeMatch(t, kE5M2Float_code, 8);
+  return TypeMatch(t, DataType::TypeCode::kE4M3Float, 8) || TypeMatch(t, DataType::TypeCode::kE5M2Float, 8);
 }    
   
 
@@ -172,8 +175,6 @@ void CallCublasLt(cublasLtHandle_t hdl, cudaStream_t stream,
                   cublasLtMatmulPreference_t matmul_pref_desc, const DLTensor* A, const DLTensor* B,
                   const DLTensor* bias, const DLTensor* C, bool transa, bool transb,
                   void* workspace_ptr, size_t workspace_size, cublasLtEpilogue_t epilogue) {
-  ICHECK( TypeEqual(A->dtype, B->dtype)
-	  || (CheckIsFP8(A->dtype) && CheckIsFP8(B->dtype)) );  // fp8 allows mixed format (eg e4m3 x e5m2)
   // Reversed strides indicates an in-place transpose operation.
   transa = IsInPlaceTransposed(A) ? !transa : transa;
   transb = IsInPlaceTransposed(B) ? !transb : transb;
@@ -323,79 +324,84 @@ void CallCublasLt(cublasLtHandle_t hdl, cudaStream_t stream,
 }
 
 inline void CallLtFP8Gemm(TVMArgs args, TVMRetValue* ret, cublasLtHandle_t hdl, cudaStream_t stream) {
-  // This function uses the cublsLt notion wherever possible. A and B are operands. C is bias. D is output.
+  // TVM uses row major ordering, while cublas uses column major. Rather than do extra transposes,
+  //  we compute AxB as (B^t x A^t)^t . To avoid tensor naming confusion, A,B,C,D refer to cublas arguments,
+  //  while X,Y,Z,Q refer to the TVM tensors. A=Y^t, B=X^t, C=Z^t, D=Q^t .
+  // In addition, the FP8 cublas call needs A to be transposed, so our computation is:
+  // Q^t = D = A^t x B ==> Q^t = Y^t^t x X^t ==> Q^t = Y x X^t => Q = (Y x X^t)^t
+  // Switching between row/col major is a transpose, so we need Q = Y^t x X
   
-  // TODO: make sure TVM alignment is at least 16 bytes (tensor pointers must be 16B aligned)
-  // TODO: currently defaulting to column order layout; double check that's right
-  
-  DLTensor* A = args[0];
-  DLTensor* B = args[1];
-  DLTensor* D = args[2];
-  bool transa = args[3];
-  bool transb = args[4];
-  DLTensor* A_scale = args[5];
-  DLTensor* B_scale = args[6];
-  DLTensor* D_scale = args[7];
-  bool fast_accum = args[8];
+  DLTensor* X = args[0];  // TVM lhs tensor
+  DLTensor* Y = args[1];  // TVM rhs tensor
+  // DLTensor* Z;  // TVM bias tensor not currently implemented
+  DLTensor* Q = args[2];  // TVM output tensor
+  bool transx = args[3];  // Whether tensor X should be transposed in the op
+  bool transy = args[4];  // Whether tensor Y should be transposed in the op
+  DLTensor* X_scale = args[5];  // scale factor for tensor X
+  DLTensor* Y_scale = args[6];  // scale factor for tensor Y
+  DLTensor* Q_scale = args[7];  // scale factor for tensor Q
+  int8_t fast_accum = static_cast<bool>(args[8]);  // whether or not to use fast accumulator mode (lower precision)
 
-  ICHECK( !(IsInPlaceTransposed(A) || IsInPlaceTransposed(B)) ) << "in place transpose currently unsupported for fp8";
-  ICHECK(transa && !transb) << "FP8 cublas calls require A to be tranposed and B not transposed ('TN' format)";
-  ICHECK_EQ(A->ndim, 2) << "FP8 batched matmul cublas calls not curently implemented";
-  ICHECK_EQ(B->ndim, 2) << "FP8 batched matmul cublas calls not curently implemented";
-  ICHECK_EQ(D->ndim, 2) << "FP8 batched matmul cublas calls not curently implemented";
-  ICHECK_EQ(ElementStride(A), 1);
-  ICHECK_EQ(ElementStride(B), 1);
-  ICHECK_EQ(ElementStride(D), 1);
-  CheckFP8FormatTypes(A->dtype, B->dtype, D->dtype);
+  ICHECK( !(IsInPlaceTransposed(X) || IsInPlaceTransposed(Y)) ) << "in place transpose currently unsupported for fp8";
+  ICHECK(!transx && transy) << "FP8 cublas calls require TVM tensor B to be tranposed and TVM tensor A not transposed";
+  ICHECK_EQ(X->ndim, 2) << "FP8 batched matmul cublas calls not curently implemented";
+  ICHECK_EQ(Y->ndim, 2) << "FP8 batched matmul cublas calls not curently implemented";
+  ICHECK_EQ(Q->ndim, 2) << "FP8 batched matmul cublas calls not curently implemented";
+  ICHECK_EQ(ElementStride(X), 1);
+  ICHECK_EQ(ElementStride(Y), 1);
+  ICHECK_EQ(ElementStride(Q), 1);
+  CheckFP8FormatTypes(X->dtype, Y->dtype, Q->dtype);
   
   auto compute_type = CUBLAS_COMPUTE_32F; // FP8 calls must use compute type CUBLAS_COMPUTE_32F
   auto scale_type = CUDA_R_32F;  // FP8 calls must use scale type CUDA_R_32F
-  cudaDataType_t a_type = TypeMatch(A->dtype, kE4M3Float_code, 8) ? CUDA_R_8F_E4M3 : CUDA_R_8F_E5M2;
-  cudaDataType_t b_type = TypeMatch(B->dtype, kE4M3Float_code, 8) ? CUDA_R_8F_E4M3 : CUDA_R_8F_E5M2;
+  cudaDataType_t X_type = TypeMatch(X->dtype, DataType::TypeCode::kE4M3Float, 8) ? CUDA_R_8F_E4M3 : CUDA_R_8F_E5M2;
+  cudaDataType_t Y_type = TypeMatch(Y->dtype, DataType::TypeCode::kE4M3Float, 8) ? CUDA_R_8F_E4M3 : CUDA_R_8F_E5M2;
   float alpha_val = 1.0;
   float beta_val = 0.0;
   void* alpha = &alpha_val;
   void* beta = &beta_val;
 
-  cudaDataType_t d_type = CUDA_R_16F;
-  if (TypeMatch(D->dtype, kE4M3Float_code, 8)) {
-    d_type = CUDA_R_8F_E4M3;
-  } else if (TypeMatch(D->dtype, kE5M2Float_code, 8)) {
-    d_type = CUDA_R_8F_E5M2;
-  } else ICHECK(TypeMatch(D->dtype, kDLFloat, 16));
+  cudaDataType_t Q_type = CUDA_R_16F;
+  if (TypeMatch(Q->dtype, DataType::TypeCode::kE4M3Float, 8)) {
+    Q_type = CUDA_R_8F_E4M3;
+  } else if (TypeMatch(Q->dtype, DataType::TypeCode::kE5M2Float, 8)) {
+    Q_type = CUDA_R_8F_E5M2;
+  } else ICHECK(TypeMatch(Q->dtype, kDLFloat, 16));
     
-  int M = ColumnCount(B, transb);
-  int N = RowCount(A, transa);
-  int K = ColumnCount(A, transa);
-  int lda = transb ? K : M;
-  int ldb = transa ? N : K;
+  int M = ColumnCount(Y, transy);
+  int N = RowCount(X, transx);
+  int K = ColumnCount(X, transx);
+  int lda = transy ? K : M;
+  int ldb = transx ? N : K;
   int ldd = M;
+  
+  auto A_data = static_cast<void*>(static_cast<char*>(Y->data) + Y->byte_offset);
+  auto B_data = static_cast<void*>(static_cast<char*>(X->data) + X->byte_offset);
+  auto D_data = static_cast<void*>(static_cast<char*>(Q->data) + Q->byte_offset);
+  auto A_scale_data = static_cast<void*>(static_cast<char*>(Y_scale->data) + Y_scale->byte_offset);
+  auto B_scale_data = static_cast<void*>(static_cast<char*>(X_scale->data) + X_scale->byte_offset);
+  auto D_scale_data = static_cast<void*>(static_cast<char*>(Q_scale->data) + Q_scale->byte_offset);
 
-  
-  
-  auto A_data = static_cast<void*>(static_cast<char*>(A->data) + A->byte_offset);
-  auto B_data = static_cast<void*>(static_cast<char*>(B->data) + B->byte_offset);
-  auto D_data = static_cast<void*>(static_cast<char*>(D->data) + D->byte_offset);
-  auto A_scale_data = static_cast<void*>(static_cast<char*>(A_scale->data) + A_scale->byte_offset);
-  auto B_scale_data = static_cast<void*>(static_cast<char*>(B_scale->data) + B_scale->byte_offset);
-  auto D_scale_data = static_cast<void*>(static_cast<char*>(D_scale->data) + D_scale->byte_offset);
+  ICHECK((long int)A_data % 16 == 0) << "Cublas FP8 matrix pointers must be 16B aligned.";
+  ICHECK((long int)B_data % 16 == 0) << "Cublas FP8 matrix pointers must be 16B aligned.";
+  ICHECK((long int)D_data % 16 == 0) << "Cublas FP8 matrix pointers must be 16B aligned.";
   
   cublasLtMatrixLayout_t A_desc, B_desc, D_desc;
   CHECK_CUBLAS_ERROR(
-      cublasLtMatrixLayoutCreate(&A_desc, a_type, !transb ? M : K, !transb ? K : M, lda));
+      cublasLtMatrixLayoutCreate(&A_desc, Y_type, !transy ? M : K, !transy ? K : M, lda));
   CHECK_CUBLAS_ERROR(
-      cublasLtMatrixLayoutCreate(&B_desc, b_type, !transa ? K : N, !transa ? N : K, ldb));
-  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutCreate(&D_desc, d_type, M, N, ldd));
+      cublasLtMatrixLayoutCreate(&B_desc, X_type, !transx ? K : N, !transx ? N : K, ldb));
+  CHECK_CUBLAS_ERROR(cublasLtMatrixLayoutCreate(&D_desc, Q_type, M, N, ldd));
 
   cublasLtMatmulDesc_t op_desc;
-  cublasOperation_t op_transa = CUBLASBooleanToTranspose(transa);
-  cublasOperation_t op_transb = CUBLASBooleanToTranspose(transb);
+  cublasOperation_t op_transa = CUBLASBooleanToTranspose(transy);  // must be true for fp8 calls
+  cublasOperation_t op_transb = CUBLASBooleanToTranspose(transx);  // must be false for fp8 calls
 
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescCreate(&op_desc, compute_type, scale_type));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA,
-                                                    &op_transb, sizeof(op_transb)));
-  CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
                                                     &op_transa, sizeof(op_transa)));
+  CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                                    &op_transb, sizeof(op_transb)));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
 						    &A_scale_data, sizeof(float*)));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
@@ -404,12 +410,15 @@ inline void CallLtFP8Gemm(TVMArgs args, TVMRetValue* ret, cublasLtHandle_t hdl, 
 						    &D_scale_data, sizeof(float*)));
   CHECK_CUBLAS_ERROR(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM,
 						    &fast_accum, sizeof(fast_accum)));
-						    
 
-
-  // TODO: other calls have different order, doing " alpha, B_data, A_Desc, A_data, B_desc "
-  // TODO: passing in null for C and C_desc. Since beta=0, could use D for in-place update with no bias (other calls do this)
-  CHECK_CUBLAS_ERROR(cublasLtMatmul(hdl, op_desc, alpha, A_data, A_desc, B_data, B_desc, beta, nullptr, nullptr, D_data, D_desc,
+  /*int returnedResults = 0;
+  cublasLtMatmulHeuristicResult_t heuristicResult = {};
+  CHECK_CUBLAS_ERROR(cublasLtMatmulAlgoGetHeuristic(hdl, op_desc, A_desc, B_desc, D_desc, D_desc, nullptr, 1, &heuristicResult, &returnedResults));
+  if (returnedResults == 0) {
+    LOG(ERROR) << "heuristic search failed";
+    }*/
+  
+  CHECK_CUBLAS_ERROR(cublasLtMatmul(hdl, op_desc, alpha, A_data, A_desc, B_data, B_desc, beta, D_data, D_desc, D_data, D_desc,
 				    nullptr, nullptr, 0, stream));
   
   cublasLtMatmulDescDestroy(op_desc);
